@@ -1,305 +1,156 @@
-# LoRaMorse
+# LORA-CW
 
-Two identical ESP32 stations that exchange Morse-code dots and dashes over **433 MHz LoRa**.
-
-Each station uses:
-
-- ESP32 Dev Module
-- SX1278 / Ra-02 433 MHz LoRa module
-- 1.3-inch 128×64 SH1106 I2C OLED
-- Morse key (send button)
-- Clear button
-- Active buzzer
-- Green TX LED
-- Red RX LED
-
-Flash the **same firmware** onto both ESP32 boards.
-
----
+A standalone Morse code (CW) key/receiver for ESP32, using a LoRa radio for the RF link and an SH1106 128×64 OLED for the UI. Supports over-the-air (OTA) firmware updates over WiFi once initial upload is done via USB.
 
 ## Features
 
-- Single-key Morse input (short press = dot, long press = dash)
-- Automatic character decoding after a short pause
-- Real-time transmission of individual Morse tokens over LoRa
-- Green LED + activity animation on transmit
-- Red LED + buzzer feedback on receive
-- OLED shows live TX/RX state, decoded text, RSSI, and radio status
-- Clear button resets local buffers
-- Optional Wi-Fi + ArduinoOTA for wireless firmware updates
+- Morse key input with automatic dot/dash timing and letter/word segmentation
+- LoRa transmission and reception of Morse tokens (`.`, `-`, `/`, ` `) using a simple one-byte-per-packet protocol
+- SH1106 OLED UI showing live TX/RX cards, a timing progress bar, a scrolling received-message log, RSSI signal bars, WiFi status, and a status/footer line
+- Local sidetone buzzer feedback on key-down and on received marks
+- TX/RX LED indicators (local transmission/reception only — not delivery acknowledgment)
+- Background WiFi connection with automatic retry, and ArduinoOTA support for wireless firmware updates
+- Partial-display updates (dirty-tile diffing) to keep the I2C bus and UI responsive without blocking key/radio timing
 
----
+## Hardware
 
-## Parts (two stations)
+| Component | Notes |
+|---|---|
+| ESP32 dev board | Any standard ESP32 devkit |
+| SX1278 LoRa module | 433 MHz variant expected (`LORA_FREQUENCY = 433000000L`) |
+| SH1106 128×64 OLED | I2C, hardware I2C driver (`U8G2_SH1106_128X64_NONAME_F_HW_I2C`) |
+| Morse key (paddle/switch) | Wired to `KEY_PIN`, active-low |
+| Control button | Wired to `CONTROL_PIN`, active-low |
+| Buzzer | Active buzzer expected; see note below for passive piezos |
+| TX / RX LEDs | Simple indicator LEDs |
 
-| Part                                | Qty |
-| ----------------------------------- | --: |
-| ESP32 Dev Module                    |   2 |
-| SX1278 / Ra-02 LoRa module (433 MHz)|   2 |
-| SH1106 1.3" I2C OLED (128×64)       |   2 |
-| 3.3 V active buzzer                 |   2 |
-| Green LED                           |   2 |
-| Red LED                             |   2 |
-| 220 Ω resistor                      |   4 |
-| Momentary push button               |   4 |
-| 433 MHz LoRa antenna                |   2 |
-| Breadboards + jumper wires          | as needed |
+### Pinout (default)
 
-> **Important:** Power the SX1278 and the OLED from **3.3 V only**. Never connect them to 5 V.
+| Signal | GPIO |
+|---|---|
+| LoRa SCK | 18 |
+| LoRa MISO | 19 |
+| LoRa MOSI | 23 |
+| LoRa CS (NSS) | 16 |
+| LoRa RST | 26 |
+| LoRa DIO0 | 25 |
+| OLED SDA | 21 |
+| OLED SCL | 22 |
+| Buzzer | 33 |
+| TX LED | 32 |
+| RX LED | 13 |
+| Key input | 27 |
+| Control button | 14 |
 
----
+All pins are defined as `constexpr` near the top of the sketch and can be changed there if your wiring differs.
 
-## Wiring (identical on both stations)
+## Libraries
 
-### SH1106 OLED
+- [LoRa by Sandeep Mistry](https://github.com/sandeepmistry/arduino-LoRa) — `^0.8.0`
+- [U8g2 by olikraus](https://github.com/olikraus/u8g2) — `^2.35.19`
+- ESP32 Arduino core's built-in `WiFi` and `ArduinoOTA` libraries
 
-| OLED | ESP32  | Notes      |
-| ---- | ------ | ---------- |
-| VCC  | 3V3    | Power      |
-| GND  | GND    | Ground     |
-| SDA  | GPIO21 | I2C data   |
-| SCL  | GPIO22 | I2C clock  |
+These are already declared in `platformio.ini` under `lib_deps`.
 
-### SX1278 / Ra-02 LoRa
+## Building and flashing (PlatformIO)
 
-| LoRa     | ESP32  | Notes                |
-| -------- | ------ | -------------------- |
-| VCC      | 3V3    | Power                |
-| GND      | GND    | Ground               |
-| SCK      | GPIO18 | SPI clock            |
-| MISO     | GPIO19 | SPI data from radio  |
-| MOSI     | GPIO23 | SPI data to radio    |
-| NSS / CS | GPIO16 | Chip select          |
-| RESET    | GPIO26 | Radio reset          |
-| DIO0     | GPIO25 | Radio interrupt      |
+This project ships with two environments:
 
-**Always attach a suitable 433 MHz antenna before powering or transmitting.**
+- **`env:esp32dev`** — standard USB/serial upload, used for the first flash
+- **`env:ota`** — wireless upload over WiFi via `espota`, extends `env:esp32dev`
 
-### Buttons (active-low, internal pull-up)
+### First flash (USB)
 
-| Button           | GPIO   | Other side | Purpose          |
-| ---------------- | ------ | ---------- | ---------------- |
-| Morse key / Send | GPIO27 | GND        | Dot / dash input |
-| Clear            | GPIO14 | GND        | Reset buffers    |
-
-### LEDs (each with its own 220 Ω resistor)
-
-| LED      | Wiring                          |
-| -------- | ------------------------------- |
-| Green TX | GPIO32 → 220 Ω → LED anode → GND |
-| Red RX   | GPIO13 → 220 Ω → LED anode → GND |
-
-### Active buzzer
-
-| Buzzer          | ESP32  |
-| --------------- | ------ |
-| Positive / SIG  | GPIO33 |
-| Negative / GND  | GND    |
-
----
-
-## GPIO summary
-
-| Function      | GPIO |
-| ------------- | ---: |
-| LoRa SCK      |   18 |
-| LoRa MISO     |   19 |
-| LoRa MOSI     |   23 |
-| LoRa CS / NSS |   16 |
-| LoRa RESET    |   26 |
-| LoRa DIO0     |   25 |
-| OLED SDA      |   21 |
-| OLED SCL      |   22 |
-| Buzzer        |   33 |
-| TX LED        |   32 |
-| RX LED        |   13 |
-| Morse key     |   27 |
-| Clear button  |   14 |
-
----
-
-## Morse input
-
-The firmware measures key-hold duration:
-
-| Hold time          | Result |
-| ------------------ | ------ |
-| < 250 ms           | Dot `.` |
-| ≥ 250 ms           | Dash `-` |
-
-After the last mark, the firmware waits ~850 ms of silence and then treats the sequence as a completed character.
-
-Examples:
-
-```
-.       → E
-.-      → A
-...     → S
----     → O
-```
-
-### Sending SOS
-
-1. Tap three times → `...` → wait → **S**
-2. Hold three times → `---` → wait → **O**
-3. Tap three times → `...` → wait → **S**
-
-The receiving station decodes each character and appends it to its message buffer.
-
----
-
-## LoRa protocol
-
-Both stations use:
+Before building, fill in your credentials in the sketch:
 
 ```cpp
-constexpr long LORA_FREQUENCY = 433E6;   // 433 MHz
+const char* WIFI_SSID = "your-ssid";
+const char* WIFI_PASS = "your-password";
+const char* OTA_HOSTNAME = "lora-cw";
+const char* OTA_PASSWORD = "";   // optional
 ```
 
-Tokens sent over the air:
+Then build and upload over USB:
 
-| Token | Meaning              |
-| ----- | -------------------- |
-| `.`   | Dot                  |
-| `-`   | Dash                 |
-| `/`   | End of character     |
-| ` `   | Word space           |
-
-The radio transmits each token immediately rather than waiting for a complete message.
-
----
-
-## OLED layout
-
-```
-┌──────────────────────────────────────┐
-│ LORA-CW                    WIFI OK   │
-├──────────────────┬───────────────────┤
-│ TX               │ RX                │
-│ READY / .-       │ WAIT / A          │
-├──────────────────────────────────────┤
-│ RSSI -72 dBm              MSG 4/21   │
-│ ████████                             │  ← activity bar
-│ HELLO                                │  ← received text
-├──────────────────────────────────────┤
-│ KEY READY                   433 MHz  │
-└──────────────────────────────────────┘
+```sh
+pio run -e esp32dev -t upload
+pio device monitor -b 115200
 ```
 
-- **TX card** – current marks being entered or last transmitted character
-- **RX card** – current marks being received or last received character
-- **RSSI** – last packet signal strength (or `N/A`)
-- **MSG** – characters in the rolling receive buffer
-- **Footer** – status messages, key state, radio health, or IP address
+> The board must use an **OTA-capable partition scheme** (e.g. "Minimal SPIFFS" or "Default with OTA") so `ArduinoOTA` has two app partitions to swap between.
 
----
+### Subsequent updates (OTA / WiFi)
 
-## Wi-Fi & OTA
-
-ArduinoOTA is supported for wireless updates after the first USB flash.
-
-Edit these constants in `main.cpp`:
-
-```cpp
-const char* WIFI_SSID     = "your-ssid";
-const char* WIFI_PASS     = "your-password";
-const char* OTA_HOSTNAME  = "Morse-Station-A";   // unique per station
-```
-
-Recommended hostnames:
-
-- `Morse-Station-A`
-- `Morse-Station-B`
-
-Never commit real credentials to the repository.
-
----
-
-## PlatformIO
-
-`platformio.ini`:
+Once the device has joined your WiFi network (check the serial monitor or the OLED footer for its IP address), edit `platformio.ini` and set the device's IP as the upload port:
 
 ```ini
-[env]
-platform = espressif32
-board = esp32dev
-framework = arduino
-monitor_speed = 115200
-lib_deps =
-    sandeepmistry/LoRa @ ^0.8.0
-    olikraus/U8g2 @ ^2.35.19
-
-[env:esp32dev]
-upload_speed = 921600
-build_flags =
-    -D CORE_DEBUG_LEVEL=0
-
 [env:ota]
 extends = env:esp32dev
 upload_protocol = espota
-upload_port =        # ← change to the ESP32’s IP
+upload_port = 192.168.1.42   ; replace with your device's IP
 upload_flags =
     --progress
 ```
 
-### Build & upload (USB)
+Then upload wirelessly:
 
-```bash
-pio run -e esp32dev -t upload
-```
-
-### Serial monitor
-
-```bash
-pio device monitor -b 115200
-```
-
-### OTA upload
-
-1. Note the IP shown on the OLED footer (or Serial).
-2. Set `upload_port` in `platformio.ini`.
-3. Run:
-
-```bash
+```sh
 pio run -e ota -t upload
 ```
 
----
+While an OTA update is in progress, the device suspends normal key/radio operation, silences all outputs, and shows a progress screen on the OLED. **Keep the device powered during the update.**
 
-## First-time setup
+## Controls
 
-1. Wire both stations exactly as shown above.
-2. Attach 433 MHz antennas.
-3. (Optional) Fill in Wi-Fi credentials and unique OTA hostnames.
-4. Connect the first ESP32 via USB and upload.
-5. Repeat for the second board.
-6. Test Morse transmission between the two stations.
-7. Once OTA works, subsequent updates can be done wirelessly.
+| Action | Result |
+|---|---|
+| Tap **KEY**, release under 250 ms | Sends a dot |
+| Tap **KEY**, hold 250 ms or more | Sends a dash |
+| Pause 850 ms after the last mark | Ends the current letter (auto-sent) |
+| Tap **CONTROL** (release before 700 ms) | Clears local input/display buffers |
+| Hold **CONTROL** for 700 ms | Sends a word space |
 
----
+Clearing the buffers only affects local/pending state — any letter already transmitted over LoRa cannot be recalled.
+
+## Display layout
+
+- **Header** — title, LoRa status ("433" or "RF!"), RSSI bars + value (or "RX --" if nothing received yet), WiFi status bars/X
+- **TX card** — current outgoing dot/dash pattern, decoded letter preview, lit while keying
+- **RX card** — current incoming dot/dash pattern, last decoded letter, lit briefly on reception
+- **Progress bar** — fills to show elapsed time toward the current threshold (dot/dash split, control hold, or letter-pause timeout)
+- **Log** — last two lines (up to 48 characters) of the received message
+- **Footer** — rotates between radio/WiFi status, transient status messages, TX queue size, and the device's IP address
+
+## Protocol notes
+
+- Each Morse element is sent as a single raw byte over LoRa: `.`, `-`, `/` (end of letter), or ` ` (word space).
+- LoRa radio defaults (including **CRC off**) are intentionally preserved to remain compatible with the original peer device — do not enable CRC without also updating the receiving end.
+- TX/RX LED indicators reflect **local** transmit/receive activity only; there is no delivery acknowledgment from the remote peer.
+
+## Configuration reference
+
+Key tunables are defined as `constexpr` values near the top of the sketch:
+
+| Constant | Purpose |
+|---|---|
+| `LORA_FREQUENCY` | LoRa carrier frequency (Hz) |
+| `OLED_I2C_HZ` | OLED I2C bus speed; lower to `100000` if your module/wiring needs it |
+| `KEY_SIDETONE` | Set `false` to disable the local sidetone (receive-only audio) |
+| `DOT_DASH_SPLIT_MS` | Threshold between a dot and a dash |
+| `CHARACTER_PAUSE_MS` | Gap that ends a letter |
+| `CONTROL_HOLD_MS` | Hold duration on CONTROL to send a word space |
+| `TX_TIMEOUT_MS` | Increase if using very slow LoRa settings |
+| `RX_STALE_MS` | Time before an incomplete received letter is discarded |
+| `WIFI_CONNECT_TIMEOUT_MS` / `WIFI_RETRY_INTERVAL_MS` | WiFi connection attempt/retry timing |
+
+## Hardware notes
+
+- The buzzer is assumed to be **active** (driven simply HIGH/LOW). If you use a **passive piezo**, you'll need to drive `BUZZER_PIN` with PWM/tone output instead of a digital HIGH/LOW.
+- Radio TX and WiFi connection waits are cooperative (non-blocking in the main loop), but LoRa SPI transfers, radio initialization, and the actual OTA flash write are synchronous and will briefly block.
 
 ## Troubleshooting
 
-| Symptom                  | Check                                                                 |
-| ------------------------ | --------------------------------------------------------------------- |
-| OLED blank               | VCC→3V3, GND, SDA→21, SCL→22, SH1106 configuration                  |
-| LoRa fails to init       | 3.3 V power, shared GND, SPI pins, CS/RST/DIO0, antenna connected   |
-| No messages received     | Both modules are 433 MHz, same frequency, antennas present, same firmware |
-| Morse key does nothing   | GPIO27 → button → GND (active-low)                                   |
-| Clear button does nothing| GPIO14 → button → GND                                                |
-| OTA fails                | Same network, correct IP in `upload_port`, ArduinoOTA running        |
-
----
-
-## Safety notes
-
-- Never power the SX1278 or SH1106 from 5 V.
-- Always use a 220 Ω series resistor with each LED.
-- Keep the LoRa antenna connected whenever the radio is powered or transmitting.
-- Use a clean, regulated 3.3 V supply for the radio and display.
-
----
-
-## Power
-
-Both stations are powered from the ESP32 USB port. Current draw varies with LoRa TX, OLED, Wi-Fi, and buzzer activity.
+- **"RADIO OFFLINE" / "RF!" in header** — check LoRa module wiring (SPI pins, CS/RST/DIO0) and frequency match with the peer.
+- **OLED shows nothing** — verify I2C wiring and try lowering `OLED_I2C_HZ` to `100000`.
+- **WiFi never connects** — Morse/LoRa functionality still works without WiFi; OTA simply won't be available until the device joins the network. Check credentials and signal strength.
+- **OTA upload fails** — confirm the board's partition scheme supports OTA, that the device is on the same network, and that `upload_port` in `platformio.ini` matches the device's current IP.
