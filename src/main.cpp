@@ -134,7 +134,8 @@ void drawSignalIcon(bool active, bool receive) {
   display.drawLine(x + 5, y + 4, x + 7, y + 6);
   if (active) {
     const uint8_t wave = (millis() - activityStartedAt) / 90 % 3;
-    display.drawCircle(x + 5, y + 6, 5 + wave);
+    // U8g2 arcs use one circular radius and 0–255 angle units.
+    display.drawArc(x + 5, y + 6, 5 + wave, 150, 234);
     if (receive) display.drawDisc(x + 5, y + 6, 2);
   }
 }
@@ -145,13 +146,13 @@ void drawUi() {
 
   display.clearBuffer();
 
-  // Header: deliberately compact for the 128 x 64 SH1106 panel.
+  // Header uses only fixed, short labels so nothing can collide with the icon.
   display.drawBox(0, 0, 128, 13);
   display.setDrawColor(0);
   display.setFont(u8g2_font_6x10_tf);
   display.drawStr(4, 10, "MORSE LINK");
   display.setFont(u8g2_font_5x7_tf);
-  display.drawStr(77, 9, "433 MHz");
+  display.drawStr(79, 9, "433M");
   display.setDrawColor(1);
   drawSignalIcon(active, rxActivity);
 
@@ -178,16 +179,9 @@ void drawUi() {
     display.drawBox(5, 46, 18, 3);
   }
 
-  // Bottom line is the decoded conversation, followed by brief plain-language state.
+  // One dedicated bottom line: never draw a status label on top of this text.
   display.setFont(u8g2_font_6x10_tf);
   display.drawStr(4, 61, receivedText[0] ? receivedText : "Tap key to send");
-  if ((!receivedText[0] || now - statusChangedAt < STATUS_HOLD_MS) && statusText[0]) {
-    display.setDrawColor(0);
-    display.drawBox(92, 52, 33, 10);
-    display.setDrawColor(1);
-    display.setFont(u8g2_font_4x6_tf);
-    display.drawStr(94, 59, statusText);
-  }
 
   display.sendBuffer();
   screenDirty = false;
@@ -329,7 +323,8 @@ void setup() {
 
   Wire.begin(OLED_SDA, OLED_SCL);
   display.begin();
-  display.setBusClock(400000); // The SH1106 display supports fast I2C updates.
+  // 100 kHz is more tolerant of long breadboard jumpers than fast-mode I2C.
+  display.setBusClock(100000);
 
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
   LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
