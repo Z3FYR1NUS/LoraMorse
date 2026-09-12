@@ -1,33 +1,3 @@
-/*
- * LORA-CW | ESP32 + SX1278 + SH1106 128 x 64
- *
- * Libraries: LoRa by Sandeep Mistry, U8g2 by olikraus, and the ESP32
- * core's WiFi / ArduinoOTA libraries. Use an OTA-capable partition scheme.
- *
- * Controls:
- *   KEY: dot below 250 ms, dash at/above 250 ms; 850 ms gap ends a letter.
- *   CONTROL: tap to clear locally; hold 700 ms to send a word space.
- *   Clearing closes a pending transmitted letter: sent marks cannot be undone.
- *
- * The original pins and one-byte '.', '-', '/', ' ' protocol are preserved.
- * LoRa defaults are preserved, including CRC off, for the original peer.
- * TX indicators mean local transmission, not acknowledged delivery.
- * The buzzer is assumed to be ACTIVE / externally driven, as in the original.
- * Set KEY_SIDETONE=false for receive-only audio. A passive piezo needs PWM.
- *
- * Display: 25 fps maximum, 400 kHz I2C, changed 8x8 tiles only; at most
- * 32 display data bytes per loop. An extra 1024-byte shadow buffer tracks
- * updates. Set OLED_I2C_HZ=100000 if your wiring/module needs a slower bus.
- * Radio TX and WiFi connection waits are cooperative. Wire transfers, radio
- * initialization and ArduinoOTA's actual flash update remain synchronous.
- * During OTA, key/radio operation is suspended and all outputs are silenced.
- *
- * API references:
- * https://github.com/sandeepmistry/arduino-LoRa/blob/master/API.md
- * https://github.com/olikraus/u8g2/wiki/u8g2reference#updatedisplayarea
- * https://github.com/espressif/arduino-esp32/tree/master/libraries/ArduinoOTA
- */
-
 #include <Arduino.h>
 #include <SPI.h>
 #include <Wire.h>
@@ -40,6 +10,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include "mbedtls/aes.h"
+#include "esp_system.h"
 
 // Configuration -------------------------------------------------------------
 const char* WIFI_SSID = "";
@@ -83,6 +55,15 @@ constexpr uint8_t TILES_X = SCREEN_W / 8, TILES_Y = SCREEN_H / 8;
 constexpr uint16_t TILE_COUNT = TILES_X * TILES_Y;
 constexpr uint8_t TILES_PER_TRANSFER = 4;
 constexpr size_t FRAME_BYTES = SCREEN_W * SCREEN_H / 8;
+
+// --- Encryption --------------------------------------------------------
+// Pre-shared 128-bit key. MUST be identical on both ends of the radio link.
+constexpr uint8_t AES_KEY[16] = {
+
+};
+
+constexpr uint8_t NONCE_LEN = 8;
+constexpr uint8_t ENC_PACKET_LEN = NONCE_LEN + 2;  // nonce + ciphertext byte + tag byte
 
 U8G2_SH1106_128X64_NONAME_F_HW_I2C display(
     U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
@@ -295,6 +276,40 @@ void radioFailure(const char* message) {
     Serial.println(message);
 }
 
+// --- Encryption --------------------------------------------------------
+void deriveKeystream(const uint8_t nonce[NONCE_LEN], uint8_t keystream[16]) {
+    uint8_t block[16] = {0};
+    memcpy(block, nonce, NONCE_LEN);  // Remaining bytes are zero padding.
+
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_enc(&aes, AES_KEY, 128);
+    mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, block, keystream);
+    mbedtls_aes_free(&aes);
+}
+
+void encryptToken(uint8_t token, uint8_t out[ENC_PACKET_LEN]) {
+    uint8_t nonce[NONCE_LEN];
+    const uint32_t r1 = esp_random(), r2 = esp_random();  // Hardware TRNG.
+    memcpy(nonce, &r1, 4);
+    memcpy(nonce + 4, &r2, 4);
+
+    uint8_t keystream[16];
+    deriveKeystream(nonce, keystream);
+
+    memcpy(out, nonce, NONCE_LEN);
+    out[NONCE_LEN] = token ^ keystream[0];
+    out[NONCE_LEN + 1] = keystream[1];  // Authentication tag.
+}
+
+bool decryptToken(const uint8_t in[ENC_PACKET_LEN], uint8_t* token) {
+    uint8_t keystream[16];
+    deriveKeystream(in, keystream);  // First NONCE_LEN bytes of `in` are the nonce.
+    if (in[NONCE_LEN + 1] != keystream[1]) return false;  // Bad tag: drop the packet.
+    *token = in[NONCE_LEN] ^ keystream[0];
+    return true;
+}
+
 void serviceRadio(uint32_t now) {
     if (!radioReady || otaActive) return;
     if (txBusy) {
@@ -318,9 +333,22 @@ void serviceRadio(uint32_t now) {
     if (packetSize > 0) {
         lastRssi = LoRa.packetRssi();
         hasRssi = true;
-        while (LoRa.available()) {
-            const int value = LoRa.read();
-            if (value >= 0) handleReceivedToken(char(value), now);
+        if (packetSize == ENC_PACKET_LEN) {
+            uint8_t packet[ENC_PACKET_LEN];
+            uint8_t received = 0;
+            while (LoRa.available() && received < ENC_PACKET_LEN) {
+                const int value = LoRa.read();
+                if (value >= 0) packet[received++] = uint8_t(value);
+            }
+            uint8_t token = 0;
+            if (received == ENC_PACKET_LEN && decryptToken(packet, &token)) {
+                handleReceivedToken(char(token), now);
+            } else {
+                setStatus("BAD/UNAUTH PACKET");
+            }
+        } else {
+            while (LoRa.available()) LoRa.read();  // Discard unexpected-size packet.
+            setStatus("BAD PACKET SIZE");
         }
         screenDirty = true;
         if (!txCount) LoRa.parsePacket();  // Re-arm single RX after consuming FIFO.
@@ -328,7 +356,9 @@ void serviceRadio(uint32_t now) {
     if (!txCount) return;
     if (!LoRa.beginPacket()) return;
     const TxItem item = txQueue[txHead];
-    if (LoRa.write(uint8_t(item.token)) != 1 || !LoRa.endPacket(true)) {
+    uint8_t packet[ENC_PACKET_LEN];
+    encryptToken(uint8_t(item.token), packet);
+    if (LoRa.write(packet, ENC_PACKET_LEN) != ENC_PACKET_LEN || !LoRa.endPacket(true)) {
         radioFailure("TX START FAILED");
         return;
     }
