@@ -1,11 +1,11 @@
 # LORA-CW
 
-A standalone Morse code (CW) key/receiver for ESP32, using a LoRa radio for the RF link and an SH1106 128×64 OLED for the UI. Supports over-the-air (OTA) firmware updates over WiFi once initial upload is done via USB.
+A standalone Morse code (CW) key/receiver for ESP32, using a LoRa radio for the RF link and an SH1106 128×64 OLED for the UI. RF packets are encrypted and authenticated with AES-128. Supports over-the-air (OTA) firmware updates over WiFi once the initial upload is done via USB.
 
 ## Features
 
 - Morse key input with automatic dot/dash timing and letter/word segmentation
-- LoRa transmission and reception of Morse tokens (`.`, `-`, `/`, ` `) using a simple one-byte-per-packet protocol
+- **Encrypted, authenticated LoRa link** — every packet is AES-128 protected; corrupted or forged packets are rejected before they reach the decoder
 - SH1106 OLED UI showing live TX/RX cards, a timing progress bar, a scrolling received-message log, RSSI signal bars, WiFi status, and a status/footer line
 - Local sidetone buzzer feedback on key-down and on received marks
 - TX/RX LED indicators (local transmission/reception only — not delivery acknowledgment)
@@ -49,6 +49,7 @@ All pins are defined as `constexpr` near the top of the sketch and can be change
 - [LoRa by Sandeep Mistry](https://github.com/sandeepmistry/arduino-LoRa) — `^0.8.0`
 - [U8g2 by olikraus](https://github.com/olikraus/u8g2) — `^2.35.19`
 - ESP32 Arduino core's built-in `WiFi` and `ArduinoOTA` libraries
+- ESP32 Arduino core's bundled **mbedtls** (`mbedtls/aes.h`) for AES-128, and `esp_random()` (hardware TRNG) — no extra dependency needed
 
 These are already declared in `platformio.ini` under `lib_deps`.
 
@@ -61,16 +62,33 @@ This project ships with two environments:
 
 ### First flash (USB)
 
-Before building, fill in your credentials in the sketch:
+Before building, fill in your WiFi/OTA credentials and generate an encryption key.
+
+**1. Generate a key on your own machine** (never paste real keys into chat, tickets, or anywhere else they could leak):
+
+```sh
+openssl rand -hex 16
+```
+
+This prints a 32-character hex string, e.g. `9f2c...` (illustrative only — generate your own).
+
+**2. Paste it into `main.cpp`:**
 
 ```cpp
 const char* WIFI_SSID = "your-ssid";
 const char* WIFI_PASS = "your-password";
 const char* OTA_HOSTNAME = "lora-cw";
 const char* OTA_PASSWORD = "";   // optional
+
+// Paste your own openssl rand -hex 16 output here — do not reuse this example:
+constexpr char AES_KEY_HEX[] = "9f2c8a3e1d4b6f705c9a2e8d1b4f6073";
 ```
 
-Then build and upload over USB:
+The firmware decodes `AES_KEY_HEX` into the raw AES key once at boot (`loadAesKeyFromHex()` in `setup()`). If the string is missing, the wrong length, or contains a non-hex character, the device halts and prints an error over serial instead of silently running with a broken key.
+
+> Don't commit your real `AES_KEY_HEX` to a public repository. Consider moving it into a local, gitignored header, or loading it from NVS, once you're past initial bring-up.
+
+**3. Build and upload over USB:**
 
 ```sh
 pio run -e esp32dev -t upload
@@ -119,20 +137,52 @@ Clearing the buffers only affects local/pending state — any letter already tra
 - **RX card** — current incoming dot/dash pattern, last decoded letter, lit briefly on reception
 - **Progress bar** — fills to show elapsed time toward the current threshold (dot/dash split, control hold, or letter-pause timeout)
 - **Log** — last two lines (up to 48 characters) of the received message
-- **Footer** — rotates between radio/WiFi status, transient status messages, TX queue size, and the device's IP address
+- **Footer** — rotates between radio/WiFi status, transient status messages (including `BAD/UNAUTH PACKET` or `BAD PACKET SIZE` if a corrupted/foreign packet is rejected), TX queue size, and the device's IP address
+
+## Security / packet encryption
+
+Every over-the-air packet carries a single logical Morse token (`.`, `-`, `/`, or `' '`), but the on-air bytes are encrypted and authenticated:
+
+```
+[8-byte random nonce][1-byte ciphertext][1-byte authentication tag]   (10 bytes total)
+```
+
+How it works:
+
+- A fresh, random 8-byte nonce (from the ESP32's hardware TRNG, `esp_random()`) is generated for **every** packet.
+- That nonce is encrypted once with AES-128-ECB under the pre-shared key, producing 16 keystream bytes. This uses AES as a keyed PRF rather than a traditional stream-cipher mode — since the nonce never repeats, no keystream byte is ever reused, so there's no counter/IV state to keep in sync between TX and RX.
+- **Ciphertext** = `token XOR keystream[0]`
+- **Tag** = `keystream[1]` — the receiver independently recomputes the keystream from the received nonce and its own copy of the key; if the received tag doesn't match, the packet is dropped as corrupted or forged, without ever touching the decoder.
+
+### Key setup
+
+The raw 16-byte AES key is never typed in by hand. Instead:
+
+1. Generate 32 hex characters with `openssl rand -hex 16`.
+2. Paste that string into `AES_KEY_HEX` in `main.cpp`.
+3. At boot, `loadAesKeyFromHex()` decodes it into the working `AES_KEY` array and halts with a serial error if the string is the wrong length or contains invalid characters.
+4. Paste the **exact same** `AES_KEY_HEX` value into both the transmitting and receiving device's firmware — the link only works if both sides derive the same keystream.
+
+Implications:
+
+- **Not compatible with an unmodified/original peer.** Both ends of the link must run this firmware version and share the identical key.
+- **Packet size increased** from 1 byte to 10 bytes, which proportionally increases per-packet LoRa airtime. This is still trivial relative to a human keying speed.
+- **LoRa's CRC remains off** (matching the original defaults) — the authentication tag independently catches corruption and forgery, so a separate CRC isn't needed for this purpose.
+- This provides confidentiality and per-packet authenticity, but **not replay protection** — a captured packet re-sent later would still decrypt to a valid single mark. Given that a lone dot/dash carries no exploitable state on its own, this is an accepted trade-off; a sequence number could be added if stronger guarantees against replay/injection are needed.
+- **Never paste a real key into chat tools, tickets, commit messages, or anywhere else outside the device's own firmware** — treat any key that has been typed somewhere else as compromised and regenerate it.
 
 ## Protocol notes
 
-- Each Morse element is sent as a single raw byte over LoRa: `.`, `-`, `/` (end of letter), or ` ` (word space).
-- LoRa radio defaults (including **CRC off**) are intentionally preserved to remain compatible with the original peer device — do not enable CRC without also updating the receiving end.
+- Each Morse element is sent as one AES-protected packet (see above) rather than a bare byte.
 - TX/RX LED indicators reflect **local** transmit/receive activity only; there is no delivery acknowledgment from the remote peer.
 
 ## Configuration reference
 
-Key tunables are defined as `constexpr` values near the top of the sketch:
+Key tunables are defined near the top of the sketch:
 
 | Constant | Purpose |
 |---|---|
+| `AES_KEY_HEX` | 32-character hex string (16 bytes) decoded into the AES key at boot; must match on both peers |
 | `LORA_FREQUENCY` | LoRa carrier frequency (Hz) |
 | `OLED_I2C_HZ` | OLED I2C bus speed; lower to `100000` if your module/wiring needs it |
 | `KEY_SIDETONE` | Set `false` to disable the local sidetone (receive-only audio) |
@@ -146,11 +196,14 @@ Key tunables are defined as `constexpr` values near the top of the sketch:
 ## Hardware notes
 
 - The buzzer is assumed to be **active** (driven simply HIGH/LOW). If you use a **passive piezo**, you'll need to drive `BUZZER_PIN` with PWM/tone output instead of a digital HIGH/LOW.
-- Radio TX and WiFi connection waits are cooperative (non-blocking in the main loop), but LoRa SPI transfers, radio initialization, and the actual OTA flash write are synchronous and will briefly block.
+- Radio TX and WiFi connection waits are cooperative (non-blocking in the main loop), but LoRa SPI transfers, radio initialization, AES operations, and the actual OTA flash write are synchronous and will briefly block.
 
 ## Troubleshooting
 
+- **Device halts at boot printing `[FATAL] AES_KEY_HEX must be exactly 32 hex characters`** — `AES_KEY_HEX` was left as the placeholder, is the wrong length, or contains a typo. Generate a fresh key with `openssl rand -hex 16` and paste the full 32-character string in.
 - **"RADIO OFFLINE" / "RF!" in header** — check LoRa module wiring (SPI pins, CS/RST/DIO0) and frequency match with the peer.
+- **"BAD/UNAUTH PACKET" in footer** — the peer's key doesn't match yours, or the packet was corrupted/foreign. Confirm both devices run this firmware and share the identical `AES_KEY_HEX`.
+- **"BAD PACKET SIZE" in footer** — something on the same frequency sent a packet that isn't 10 bytes (e.g. an unmodified/original peer, or unrelated LoRa traffic).
 - **OLED shows nothing** — verify I2C wiring and try lowering `OLED_I2C_HZ` to `100000`.
 - **WiFi never connects** — Morse/LoRa functionality still works without WiFi; OTA simply won't be available until the device joins the network. Check credentials and signal strength.
 - **OTA upload fails** — confirm the board's partition scheme supports OTA, that the device is on the same network, and that `upload_port` in `platformio.ini` matches the device's current IP.

@@ -57,10 +57,13 @@ constexpr uint8_t TILES_PER_TRANSFER = 4;
 constexpr size_t FRAME_BYTES = SCREEN_W * SCREEN_H / 8;
 
 // --- Encryption --------------------------------------------------------
-// Pre-shared 128-bit key. MUST be identical on both ends of the radio link.
-constexpr uint8_t AES_KEY[16] = {
+// Paste a freshly generated 32-character hex string (16 bytes)
+// from:  openssl rand -hex 16
+// MUST be identical on both ends of the radio link, MUST be replaced from
 
-};
+constexpr char AES_KEY_HEX[] = "";
+
+uint8_t AES_KEY[16] = {0};  // Populated from AES_KEY_HEX in setup().
 
 constexpr uint8_t NONCE_LEN = 8;
 constexpr uint8_t ENC_PACKET_LEN = NONCE_LEN + 2;  // nonce + ciphertext byte + tag byte
@@ -277,6 +280,42 @@ void radioFailure(const char* message) {
 }
 
 // --- Encryption --------------------------------------------------------
+// A fresh random nonce is generated for every packet, so AES is used here
+// as a keyed PRF rather than in a traditional counter-based stream-cipher
+// mode: encrypting the nonce once per packet yields 16 keystream bytes,
+// of which byte 0 masks the plaintext token and byte 1 becomes an
+// authentication tag. Because the nonce never repeats, no keystream bytes
+// are ever reused, so no explicit counter/IV bookkeeping is needed between
+// TX and RX. A receiver that doesn't hold AES_KEY cannot compute a valid
+// tag for a chosen nonce, so this also rejects corrupted or forged packets.
+bool hexCharToNibble(char c, uint8_t* nibble) {
+    if (c >= '0' && c <= '9') { *nibble = uint8_t(c - '0'); return true; }
+    if (c >= 'a' && c <= 'f') { *nibble = uint8_t(c - 'a' + 10); return true; }
+    if (c >= 'A' && c <= 'F') { *nibble = uint8_t(c - 'A' + 10); return true; }
+    return false;
+}
+
+// Decodes AES_KEY_HEX into AES_KEY once at boot. Halts with a clear serial
+// message on any malformed key rather than silently running with a wrong or
+// zeroed key, since that would look like "it works" while sending plaintext
+// wrapped in a broken cipher.
+void loadAesKeyFromHex() {
+    if (strlen(AES_KEY_HEX) != 32) {
+        Serial.println("[FATAL] AES_KEY_HEX must be exactly 32 hex characters (16 bytes).");
+        Serial.println("[FATAL] Generate one with: openssl rand -hex 16");
+        while (true) delay(1000);
+    }
+    for (uint8_t i = 0; i < 16; ++i) {
+        uint8_t hi, lo;
+        if (!hexCharToNibble(AES_KEY_HEX[i * 2], &hi) ||
+            !hexCharToNibble(AES_KEY_HEX[i * 2 + 1], &lo)) {
+            Serial.println("[FATAL] AES_KEY_HEX contains a non-hex character.");
+            while (true) delay(1000);
+        }
+        AES_KEY[i] = uint8_t((hi << 4) | lo);
+    }
+}
+
 void deriveKeystream(const uint8_t nonce[NONCE_LEN], uint8_t keystream[16]) {
     uint8_t block[16] = {0};
     memcpy(block, nonce, NONCE_LEN);  // Remaining bytes are zero padding.
@@ -774,6 +813,7 @@ void maintainWiFi(uint32_t now) {
 // Entry points --------------------------------------------------------------
 void setup() {
     Serial.begin(115200);
+    loadAesKeyFromHex();  // Halts here if AES_KEY_HEX was left invalid/placeholder.
     pinMode(KEY_PIN, INPUT_PULLUP);
     pinMode(CONTROL_PIN, INPUT_PULLUP);
     pinMode(BUZZER_PIN, OUTPUT);
