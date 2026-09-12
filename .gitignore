@@ -1,5 +1,27 @@
-.pio
-.vscode/.browse.c_cpp.db*
-.vscode/c_cpp_properties.json
-.vscode/launch.json
-.vscode/ipch
+# PlatformIO build outputs and caches
+.pio/
+.pioenvs/
+.piolibdeps/
+.clangd/
+
+# VS Code directory (ignore completely to avoid local state tracking)
+.vscode/
+
+# C/C++ Compilation & Linker artifacts
+*.o
+*.elf
+*.bin
+*.hex
+*.out
+*.map
+
+# OS / Environment noise (Windows / macOS)
+Thumbs.db
+Desktop.ini
+[Dd]esktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# Local configuration overrides
+platformio.ini.local
+*.local
