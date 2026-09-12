@@ -1,613 +1,337 @@
-#include <Arduino.h>
+// -----------------------------------------------------------------------------
+// OLED Driver Diagnostic — isolate whether the white panel's top-row
+// corruption is a controller/driver mismatch (SH1106 vs SSD1306) or a
+// hardware defect in this specific unit.
+//
+// HOW TO USE:
+//   1. Flash this to the ESP32 with the white panel connected on the same
+//      SDA/SCL pins as the main project (21/22 below — change if different).
+//   2. Watch the OLED. It cycles through 4 test patterns every 2 seconds,
+//      each printed to Serial too so you can log what you see against what
+//      pattern was active.
+//   3. Change ACTIVE_DRIVER below to try each constructor in turn. Re-flash
+//      between each one — only one can be compiled in at a time.
+//   4. Whichever driver renders ALL FOUR patterns cleanly (especially
+//      pattern 1, the full-width top fill) is the correct one for this
+//      panel. If NONE of them fix the top-row corruption, that's strong
+//      confirmation the panel itself is defective rather than a driver
+//      mismatch.
+// -----------------------------------------------------------------------------
+
 #include <SPI.h>
 #include <Wire.h>
-#include <LoRa.h>
-#include <U8g2lib.h>
-#include <WiFi.h>
-#include <ArduinoOTA.h>
 
-// -----------------------------------------------------------------------------
-// Network & OTA Configuration
-// -----------------------------------------------------------------------------
-
-const char *WIFI_SSID = "";
-const char *WIFI_PASS = "";
+const char *WIFI_SSID = "Wifi_2.4Ghz";
+const char *WIFI_PASS = "Chaisanit1!";
 const char *OTA_HOSTNAME = "ESP32-Morse-Station";
 
-// -----------------------------------------------------------------------------
-// Hardware Configuration
-// -----------------------------------------------------------------------------
+#define OLED_RESET 4
 
-constexpr long LORA_FREQUENCY = 433E6;
+#define NUMFLAKES 10
+#define XPOS 0
+#define YPOS 1
+#define DELTAY 2
 
-constexpr uint16_t DOT_DASH_SPLIT_MS = 250;
-constexpr uint16_t CHARACTER_PAUSE_MS = 850;
+#define LOGO16_GLCD_HEIGHT 16
+#define LOGO16_GLCD_WIDTH  16
 
-constexpr uint16_t TX_FLASH_MS = 90;
-constexpr uint16_t RX_FLASH_MS = 120;
+static const unsigned char PROGMEM logo16_glcd_bmp[] = {
+  B00000000, B11000000,
+  B00000001, B11000000,
+  B00000001, B11000000,
+  B00000011, B11100000,
+  B11110011, B11100000,
+  B11111110, B11111000,
+  B01111110, B11111111,
+  B00110011, B10011111,
+  B00011111, B11111100,
+  B00001101, B01110000,
+  B00011011, B10100000,
+  B00111111, B11100000,
+  B00111111, B11110000,
+  B01111100, B11110000,
+  B01110000, B01110000,
+  B00000000, B00110000
+};
 
-constexpr uint16_t BEEP_DOT_MS = 55;
-constexpr uint16_t BEEP_DASH_MS = 170;
+#if (SH1106_LCDHEIGHT != 64)
+#error("Height incorrect, please fix Adafruit_SH1106.h!");
+#endif
 
-constexpr uint16_t UI_FRAME_MS = 40;
-constexpr uint16_t ACTIVITY_ANIM_MS = 350;
-constexpr uint16_t STATUS_HOLD_MS = 1500;
-
-// GPIO Definitions
-constexpr int LORA_SCK = 18;
-constexpr int LORA_MISO = 19;
-constexpr int LORA_MOSI = 23;
-constexpr int LORA_CS = 16;
-constexpr int LORA_RST = 26;
-constexpr int LORA_DIO0 = 25;
-
-constexpr int OLED_SDA = 21;
-constexpr int OLED_SCL = 22;
-
-constexpr int BUZZER_PIN = 33;
-constexpr int TX_LED_PIN = 32;
-constexpr int RX_LED_PIN = 13;
-
-constexpr int KEY_PIN = 4;
-constexpr int CONTROL_PIN = 14;
-
-// -----------------------------------------------------------------------------
-// Display Driver (SH1106 / SSD1306-class 1.3" 128x64 white panel)
-// -----------------------------------------------------------------------------
-
-U8G2_SH1106_128X64_NONAME_F_HW_I2C display(
-    U8G2_R0,
-    U8X8_PIN_NONE
-);
-
-
-constexpr int SCREEN_W = 128;
-constexpr int SCREEN_H = 64;
-
-constexpr int MARGIN = 3;   // gap from the physical screen edge to any element
-constexpr int GUTTER = 4;   // gap between two adjacent elements/panels
-constexpr int PADDING = 3;  // gap between a panel's border and its own content
-
-// Header band
-constexpr int HEADER_H = 11;
-
-// TX / RX cards (side by side, directly under the header)
-constexpr int CARD_Y = HEADER_H + 3;
-constexpr int CARD_H = 21;
-constexpr int CARD_W = (SCREEN_W - (2 * MARGIN) - GUTTER) / 2; // 59
-constexpr int TX_CARD_X = MARGIN;
-constexpr int RX_CARD_X = TX_CARD_X + CARD_W + GUTTER;
-
-// Activity bar (below the cards)
-constexpr int ACTIVITY_Y = CARD_Y + CARD_H + GUTTER;
-constexpr int ACTIVITY_H = 4;
-constexpr int ACTIVITY_X = MARGIN;
-constexpr int ACTIVITY_W = SCREEN_W - (2 * MARGIN);
-
-// Conversation log line
-constexpr int LOG_BASELINE_Y = ACTIVITY_Y + ACTIVITY_H + GUTTER + 7;
-
-// Footer divider + status line
-constexpr int FOOTER_DIVIDER_Y = LOG_BASELINE_Y + 4;
-constexpr int FOOTER_BASELINE_Y = SCREEN_H - 2;
-
-// -----------------------------------------------------------------------------
-// Global State
-// -----------------------------------------------------------------------------
-
-char outgoingMarks[7] = "";
-char receivedMarks[7] = "";
-char receivedText[22] = "";
-
-char statusText[20] = "INITIALIZING";
-
-bool keyWasDown = false;
-bool controlWasDown = false;
-bool radioReady = false;
-bool wifiConnected = false;
-bool screenDirty = true;
-
-bool txActivity = false;
-bool rxActivity = false;
-
-unsigned long keyStartedAt = 0;
-unsigned long lastMarkAt = 0;
-
-unsigned long txLedUntil = 0;
-unsigned long rxLedUntil = 0;
-unsigned long buzzerUntil = 0;
-
-unsigned long activityStartedAt = 0;
-unsigned long statusChangedAt = 0;
-unsigned long lastUiFrameAt = 0;
-
-// -----------------------------------------------------------------------------
 // Forward Declarations
-// -----------------------------------------------------------------------------
-
-void drawCenteredText(const char *text, int x, int y, int width);
-void drawRightAlignedText(const char *text, int rightEdge, int y);
-void drawFitText(const char *text, int x, int y, int width);
-void drawHeader();
-void drawBufferCards();
-void drawActivityBar();
-void drawConversationLog();
-void drawFooterStatus();
-void drawUi();
-void serviceDisplay();
-
-void sendToken(char token);
-void startTransmitActivity();
-void startReceiveActivity(char token);
-void finishOutgoingCharacter();
-
-void handleReceivedToken(char token);
-void checkRadio();
-void checkKey();
-void checkControl();
-void updateOutputs();
-
-char decodeMorse(const char *marks);
-void appendMark(char *marks, char mark);
-void appendReceivedLetter(char letter);
-void setStatus(const char *text);
-void initWiFiAndOTA();
-
-// -----------------------------------------------------------------------------
-// Morse Decoding Table
-// -----------------------------------------------------------------------------
-
-char decodeMorse(const char *marks) {
-  struct MorseEntry {
-    const char *code;
-    char letter;
-  };
-
-  static const MorseEntry table[] = {
-      {".-", 'A'},   {"-...", 'B'}, {"-.-.", 'C'}, {"-..", 'D'},  {".", 'E'},
-      {"..-.", 'F'},  {"--.", 'G'},  {"....", 'H'}, {"..", 'I'},   {".---", 'J'},
-      {"-.-", 'K'},   {".-..", 'L'}, {"--", 'M'},   {"-.", 'N'},   {"---", 'O'},
-      {".--.", 'P'},  {"--.-", 'Q'}, {".-.", 'R'},  {"...", 'S'},  {"-", 'T'},
-      {"..-", 'U'},   {"...-", 'V'}, {".--", 'W'},  {"-..-", 'X'}, {"-.--", 'Y'},
-      {"--..", 'Z'},  {"-----", '0'},{".----", '1'},{"..---", '2'},{"...--", '3'},
-      {"....-", '4'}, {".....", '5'},{"-....", '6'},{"--...", '7'},{"---..", '8'},
-      {"----.", '9'}
-  };
-
-  for (const MorseEntry &entry : table) {
-    if (strcmp(marks, entry.code) == 0) {
-      return entry.letter;
-    }
-  }
-
-  return '?';
-}
-
-// -----------------------------------------------------------------------------
-// Buffer Management
-// -----------------------------------------------------------------------------
-
-void appendMark(char *marks, char mark) {
-  const size_t length = strlen(marks);
-
-  if (length >= 6) {
-    marks[0] = '\0';
-    return;
-  }
-
-  marks[length] = mark;
-  marks[length + 1] = '\0';
-}
-
-void appendReceivedLetter(char letter) {
-  const size_t length = strlen(receivedText);
-
-  if (length < sizeof(receivedText) - 1) {
-    receivedText[length] = letter;
-    receivedText[length + 1] = '\0';
-    return;
-  }
-
-  memmove(receivedText, receivedText + 1, sizeof(receivedText) - 2);
-  receivedText[sizeof(receivedText) - 2] = letter;
-  receivedText[sizeof(receivedText) - 1] = '\0';
-}
-
-void setStatus(const char *text) {
-  strncpy(statusText, text, sizeof(statusText) - 1);
-  statusText[sizeof(statusText) - 1] = '\0';
-  statusChangedAt = millis();
-  screenDirty = true;
-}
-
-// -----------------------------------------------------------------------------
-// UI Helper Functions
-// -----------------------------------------------------------------------------
-
-void drawCenteredText(const char *text, int x, int y, int width) {
-  int textWidth = display.getStrWidth(text);
-  int textX = x + (width - textWidth) / 2;
-  if (textX < x) textX = x;
-  display.drawStr(textX, y, text);
-}
-
-// Right-aligns text against a given edge instead of a hardcoded x position,
-// so variable-length strings (IP addresses, frequencies) never run off the
-// panel the way the old fixed-offset draw did.
-void drawRightAlignedText(const char *text, int rightEdge, int y) {
-  int textWidth = display.getStrWidth(text);
-  int textX = rightEdge - textWidth;
-  if (textX < 0) textX = 0;
-  display.drawStr(textX, y, text);
-}
-
-void drawFitText(const char *text, int x, int y, int width) {
-  char buffer[12];
-  strncpy(buffer, text, sizeof(buffer) - 1);
-  buffer[sizeof(buffer) - 1] = '\0';
-
-  while (strlen(buffer) > 1 && display.getStrWidth(buffer) > width) {
-    buffer[strlen(buffer) - 1] = '\0';
-  }
-
-  drawCenteredText(buffer, x, y, width);
-}
-
-// -----------------------------------------------------------------------------
-// UI Rendering Modules
-// -----------------------------------------------------------------------------
-
-void drawHeader() {
-  display.setDrawColor(1);
-  display.drawBox(0, 0, SCREEN_W, HEADER_H);
-
-  display.setDrawColor(0);
-  display.setFont(u8g2_font_micro_tr);
-  display.drawStr(MARGIN, HEADER_H - 3, "LORA-CW");
-
-  // Right-aligned so "WIFI OK" and "NO WIFI" sit at the same visual edge
-  // instead of two slightly different hardcoded x positions.
-  drawRightAlignedText(wifiConnected ? "WIFI OK" : "NO WIFI",
-                        SCREEN_W - MARGIN, HEADER_H - 3);
-
-  display.setDrawColor(1);
-  display.drawHLine(0, HEADER_H, SCREEN_W);
-}
-
-void drawBufferCards() {
-  // TX Card Panel
-  display.drawRFrame(TX_CARD_X, CARD_Y, CARD_W, CARD_H, 2);
-  display.setFont(u8g2_font_4x6_tf);
-  display.drawStr(TX_CARD_X + PADDING, CARD_Y + PADDING + 4, "TX");
-
-  display.setFont(u8g2_font_7x14_tf);
-  const int txContentY = CARD_Y + CARD_H - PADDING - 2;
-  if (outgoingMarks[0]) {
-    drawFitText(outgoingMarks, TX_CARD_X + PADDING, txContentY, CARD_W - (2 * PADDING));
-  } else {
-    drawCenteredText(".", TX_CARD_X + PADDING, txContentY, CARD_W - (2 * PADDING));
-  }
-
-  // RX Card Panel — identical padding math to TX so the two panels match.
-  display.drawRFrame(RX_CARD_X, CARD_Y, CARD_W, CARD_H, 2);
-  display.setFont(u8g2_font_4x6_tf);
-  display.drawStr(RX_CARD_X + PADDING, CARD_Y + PADDING + 4, "RX");
-
-  display.setFont(u8g2_font_7x14_tf);
-  const int rxContentY = CARD_Y + CARD_H - PADDING - 2;
-  if (receivedMarks[0]) {
-    drawFitText(receivedMarks, RX_CARD_X + PADDING, rxContentY, CARD_W - (2 * PADDING));
-  } else {
-    drawCenteredText("-", RX_CARD_X + PADDING, rxContentY, CARD_W - (2 * PADDING));
-  }
-}
-
-void drawActivityBar() {
-  const unsigned long now = millis();
-  const bool active = txActivity || rxActivity;
-
-  display.drawFrame(ACTIVITY_X, ACTIVITY_Y, ACTIVITY_W, ACTIVITY_H);
-
-  const int trackWidth = ACTIVITY_W - 6; // inset so the moving box never clips the frame
-  if (active) {
-    const unsigned long elapsed = now - activityStartedAt;
-    uint8_t pos = (elapsed >= ACTIVITY_ANIM_MS)
-                  ? trackWidth
-                  : static_cast<uint8_t>((elapsed * static_cast<unsigned long>(trackWidth)) / ACTIVITY_ANIM_MS);
-
-    display.drawBox(ACTIVITY_X + 2 + pos, ACTIVITY_Y + 1, 4, ACTIVITY_H - 2);
-  } else if (radioReady) {
-    display.drawBox(ACTIVITY_X + 2, ACTIVITY_Y + 1, 12, ACTIVITY_H - 2);
-  }
-}
-
-void drawConversationLog() {
-  display.setFont(u8g2_font_6x10_tf);
-
-  if (!receivedText[0]) {
-    display.drawStr(MARGIN + 1, LOG_BASELINE_Y, "READY TO KEY...");
-  } else {
-    drawFitText(receivedText, MARGIN, LOG_BASELINE_Y, SCREEN_W - (2 * MARGIN));
-  }
-}
-
-void drawFooterStatus() {
-  const unsigned long now = millis();
-
-  display.drawHLine(0, FOOTER_DIVIDER_Y, SCREEN_W);
-  display.setFont(u8g2_font_4x6_tf);
-
-  if (statusText[0] && (now - statusChangedAt < STATUS_HOLD_MS)) {
-    display.drawStr(MARGIN, FOOTER_BASELINE_Y, statusText);
-  } else {
-    display.drawStr(MARGIN, FOOTER_BASELINE_Y, radioReady ? "LINK ACTIVE" : "RADIO FAIL");
-  }
-
-  // Right-aligned against the true screen edge — fixes the truncated IP,
-  // and scales to any address length or to "433MHz" without retuning an
-  // x offset by hand.
-  if (wifiConnected) {
-    drawRightAlignedText(WiFi.localIP().toString().c_str(), SCREEN_W - MARGIN, FOOTER_BASELINE_Y);
-  } else {
-    drawRightAlignedText("433MHz", SCREEN_W - MARGIN, FOOTER_BASELINE_Y);
-  }
-}
-
-void drawUi() {
-  display.clearBuffer();
-
-  drawHeader();
-  drawBufferCards();
-  drawActivityBar();
-  drawConversationLog();
-  drawFooterStatus();
-
-  display.sendBuffer();
-  screenDirty = false;
-}
-
-void serviceDisplay() {
-  const unsigned long now = millis();
-  bool active = txActivity || rxActivity;
-
-  if (active && (now - activityStartedAt >= ACTIVITY_ANIM_MS)) {
-    txActivity = false;
-    rxActivity = false;
-    screenDirty = true;
-    active = false;
-  }
-
-  if (screenDirty || (active && (now - lastUiFrameAt >= UI_FRAME_MS))) {
-    drawUi();
-    lastUiFrameAt = now;
-  }
-}
-
-// -----------------------------------------------------------------------------
-// Radio Control & Telemetry
-// -----------------------------------------------------------------------------
-
-void sendToken(char token) {
-  if (!radioReady) return;
-
-  LoRa.beginPacket();
-  LoRa.write(static_cast<uint8_t>(token));
-  LoRa.endPacket();
-}
-
-void startTransmitActivity() {
-  digitalWrite(TX_LED_PIN, HIGH);
-  txLedUntil = millis() + TX_FLASH_MS;
-  txActivity = true;
-  rxActivity = false;
-  activityStartedAt = millis();
-  screenDirty = true;
-}
-
-void startReceiveActivity(char token) {
-  digitalWrite(RX_LED_PIN, HIGH);
-  rxLedUntil = millis() + RX_FLASH_MS;
-
-  digitalWrite(BUZZER_PIN, HIGH);
-  buzzerUntil = millis() + (token == '-' ? BEEP_DASH_MS : BEEP_DOT_MS);
-
-  rxActivity = true;
-  txActivity = false;
-  activityStartedAt = millis();
-  screenDirty = true;
-}
-
-void finishOutgoingCharacter() {
-  if (!outgoingMarks[0]) return;
-
-  const char decoded = decodeMorse(outgoingMarks);
-  sendToken('/');
-  startTransmitActivity();
-
-  outgoingMarks[0] = '\0';
-
-  char message[16];
-  snprintf(message, sizeof(message), "TX: %c", decoded);
-  setStatus(message);
-}
-
-void handleReceivedToken(char token) {
-  if (token == '.' || token == '-') {
-    appendMark(receivedMarks, token);
-    setStatus(token == '.' ? "RX DOT" : "RX DASH");
-    startReceiveActivity(token);
-  } else if (token == '/' && receivedMarks[0]) {
-    appendReceivedLetter(decodeMorse(receivedMarks));
-    receivedMarks[0] = '\0';
-    setStatus("RX CHAR");
-  } else if (token == ' ') {
-    appendReceivedLetter(' ');
-    setStatus("RX SPACE");
-  }
-  screenDirty = true;
-}
-
-void checkRadio() {
-  const int packetSize = LoRa.parsePacket();
-  if (!packetSize) return;
-
-  const char token = static_cast<char>(LoRa.read());
-  while (LoRa.available()) {
-    LoRa.read();
-  }
-
-  handleReceivedToken(token);
-}
-
-// -----------------------------------------------------------------------------
-// Key & Control Handler
-// -----------------------------------------------------------------------------
-
-void checkKey() {
-  const bool keyDown = (digitalRead(KEY_PIN) == LOW);
-
-  if (keyDown && !keyWasDown) {
-    keyStartedAt = millis();
-    setStatus("KEY DOWN");
-  }
-
-  if (!keyDown && keyWasDown) {
-    const char mark = (millis() - keyStartedAt < DOT_DASH_SPLIT_MS) ? '.' : '-';
-
-    appendMark(outgoingMarks, mark);
-    sendToken(mark);
-    startTransmitActivity();
-
-    lastMarkAt = millis();
-    setStatus(mark == '.' ? "TX DOT" : "TX DASH");
-  }
-
-  keyWasDown = keyDown;
-
-  if (!keyDown && outgoingMarks[0] && (millis() - lastMarkAt >= CHARACTER_PAUSE_MS)) {
-    finishOutgoingCharacter();
-  }
-}
-
-void checkControl() {
-  const bool controlDown = (digitalRead(CONTROL_PIN) == LOW);
-
-  if (controlDown && !controlWasDown) {
-    outgoingMarks[0] = '\0';
-    receivedMarks[0] = '\0';
-    receivedText[0] = '\0';
-    setStatus("BUFFER CLEARED");
-  }
-
-  controlWasDown = controlDown;
-}
-
-void updateOutputs() {
-  const unsigned long now = millis();
-
-  if (txLedUntil && now >= txLedUntil) {
-    digitalWrite(TX_LED_PIN, LOW);
-    txLedUntil = 0;
-  }
-
-  if (rxLedUntil && now >= rxLedUntil) {
-    digitalWrite(RX_LED_PIN, LOW);
-    rxLedUntil = 0;
-  }
-
-  if (buzzerUntil && now >= buzzerUntil) {
-    digitalWrite(BUZZER_PIN, LOW);
-    buzzerUntil = 0;
-  }
-}
-
-// -----------------------------------------------------------------------------
-// Networking & OTA Handler
-// -----------------------------------------------------------------------------
-
-void initWiFiAndOTA() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  // Non-blocking WiFi connection check (up to 3 seconds wait at boot)
-  unsigned long startAttempt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 3000) {
-    delay(100);
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    wifiConnected = true;
-  }
-
-  ArduinoOTA.setHostname(OTA_HOSTNAME);
-
-  ArduinoOTA.onStart([]() {
-    setStatus("OTA STARTING");
-    serviceDisplay();
-  });
-
-  ArduinoOTA.onEnd([]() {
-    setStatus("OTA COMPLETE");
-    serviceDisplay();
-  });
-
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    char buf[16];
-    snprintf(buf, sizeof(buf), "OTA: %u%%", (progress / (total / 100)));
-    setStatus(buf);
-    serviceDisplay();
-  });
-
-  ArduinoOTA.onError([](ota_error_t error) {
-    setStatus("OTA ERROR");
-    serviceDisplay();
-  });
-
-  ArduinoOTA.begin();
-}
-
-// -----------------------------------------------------------------------------
-// Core Setup & Main Loop
-// -----------------------------------------------------------------------------
+void testdrawline(void);
+void testdrawrect(void);
+void testfillrect(void);
+void testdrawcircle(void);
+void testdrawroundrect(void);
+void testfillroundrect(void);
+void testdrawtriangle(void);
+void testfilltriangle(void);
+void testdrawchar(void);
+void testdrawbitmap(const uint8_t *bitmap, uint8_t w, uint8_t h);
 
 void setup() {
-  pinMode(KEY_PIN, INPUT_PULLUP);
-  pinMode(CONTROL_PIN, INPUT_PULLUP);
+  Serial.begin(9600);
 
-  pinMode(BUZZER_PIN, OUTPUT);
-  pinMode(TX_LED_PIN, OUTPUT);
-  pinMode(RX_LED_PIN, OUTPUT);
+  // By default, high voltage is generated internally from 3.3V
+  display.begin(SH1106_SWITCHCAPVCC, 0x3C);
 
-  digitalWrite(BUZZER_PIN, LOW);
-  digitalWrite(TX_LED_PIN, LOW);
-  digitalWrite(RX_LED_PIN, LOW);
+  // Show internal splashscreen buffer
+  display.display();
+  delay(2000);
 
-  Wire.begin(OLED_SDA, OLED_SCL);
-  display.begin();
-  display.setBusClock(400000);
+  // Clear buffer
+  display.clearDisplay();
 
-  initWiFiAndOTA();
+  // Draw single pixel
+  display.drawPixel(10, 10, WHITE);
+  display.display();
+  delay(2000);
+  display.clearDisplay();
 
-  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
-  LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
+  // Draw lines
+  testdrawline();
+  display.display();
+  delay(2000);
+  display.clearDisplay();
 
-  radioReady = LoRa.begin(LORA_FREQUENCY);
+  // Draw rectangles
+  testdrawrect();
+  display.display();
+  delay(2000);
+  display.clearDisplay();
 
-  setStatus(radioReady ? "SYSTEM READY" : "LORA INIT FAIL");
-  serviceDisplay();
+  // Draw filled rectangles
+  testfillrect();
+  display.display();
+  delay(2000);
+  display.clearDisplay();
+
+  // Draw circles
+  testdrawcircle();
+  display.display();
+  delay(2000);
+  display.clearDisplay();
+
+  // Draw filled circle
+  display.fillCircle(display.width() / 2, display.height() / 2, 10, WHITE);
+  display.display();
+  delay(2000);
+  display.clearDisplay();
+
+  // Draw rounded rectangles
+  testdrawroundrect();
+  delay(2000);
+  display.clearDisplay();
+
+  // Draw filled rounded rectangles
+  testfillroundrect();
+  delay(2000);
+  display.clearDisplay();
+
+  // Draw triangles
+  testdrawtriangle();
+  delay(2000);
+  display.clearDisplay();
+
+  // Draw filled triangles
+  testfilltriangle();
+  delay(2000);
+  display.clearDisplay();
+
+  // Render font test
+  testdrawchar();
+  display.display();
+  delay(2000);
+  display.clearDisplay();
+
+  // Text formatting test
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+  display.println("Hello, world!");
+  display.setTextColor(BLACK, WHITE); // Inverted text
+  display.println(3.141592);
+  display.setTextSize(2);
+  display.setTextColor(WHITE);
+  display.print("0x");
+  display.println(0xDEADBEEF, HEX);
+  display.display();
+  delay(2000);
+
+  // Miniature bitmap display
+  display.clearDisplay();
+  display.drawBitmap(30, 16, logo16_glcd_bmp, 16, 16, 1);
+  display.display();
+
+  // Display inversion test
+  display.invertDisplay(true);
+  delay(1000);
+  display.invertDisplay(false);
+  delay(1000);
+
+  // Animated bitmap test
+  testdrawbitmap(logo16_glcd_bmp, LOGO16_GLCD_HEIGHT, LOGO16_GLCD_WIDTH);
 }
 
 void loop() {
-  if (WiFi.status() == WL_CONNECTED) {
-    wifiConnected = true;
-    ArduinoOTA.handle();
-  } else {
-    wifiConnected = false;
+  // Main execution loops inside testdrawbitmap during diagnostic stage
+}
+
+void testdrawbitmap(const uint8_t *bitmap, uint8_t w, uint8_t h) {
+  uint8_t icons[NUMFLAKES][3];
+
+  // Initialize icon positions
+  for (uint8_t f = 0; f < NUMFLAKES; f++) {
+    icons[f][XPOS]   = random(display.width());
+    icons[f][YPOS]   = 0;
+    icons[f][DELTAY] = random(5) + 1;
+
+    Serial.print("x: ");
+    Serial.print(icons[f][XPOS], DEC);
+    Serial.print(" y: ");
+    Serial.print(icons[f][YPOS], DEC);
+    Serial.print(" dy: ");
+    Serial.println(icons[f][DELTAY], DEC);
   }
 
-  checkRadio();
-  checkKey();
-  checkControl();
-  updateOutputs();
-  serviceDisplay();
+  while (1) {
+    // Draw frame
+    for (uint8_t f = 0; f < NUMFLAKES; f++) {
+      display.drawBitmap(icons[f][XPOS], icons[f][YPOS], logo16_glcd_bmp, w, h, WHITE);
+    }
+    display.display();
+    delay(200);
+
+    // Erase and advance position
+    for (uint8_t f = 0; f < NUMFLAKES; f++) {
+      display.drawBitmap(icons[f][XPOS], icons[f][YPOS], logo16_glcd_bmp, w, h, BLACK);
+      icons[f][YPOS] += icons[f][DELTAY];
+
+      if (icons[f][YPOS] > display.height()) {
+        icons[f][XPOS]   = random(display.width());
+        icons[f][YPOS]   = 0;
+        icons[f][DELTAY] = random(5) + 1;
+      }
+    }
+  }
+}
+
+void testdrawchar(void) {
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+
+  for (uint8_t i = 0; i < 168; i++) {
+    if (i == '\n') continue;
+    display.write(i);
+    if ((i > 0) && (i % 21 == 0)) {
+      display.println();
+    }
+  }
+  display.display();
+}
+
+void testdrawcircle(void) {
+  for (int16_t i = 0; i < display.height(); i += 2) {
+    display.drawCircle(display.width() / 2, display.height() / 2, i, WHITE);
+    display.display();
+  }
+}
+
+void testfillrect(void) {
+  uint8_t color = 1;
+  for (int16_t i = 0; i < display.height() / 2; i += 3) {
+    display.fillRect(i, i, display.width() - i * 2, display.height() - i * 2, color % 2);
+    display.display();
+    color++;
+  }
+}
+
+void testdrawtriangle(void) {
+  for (int16_t i = 0; i < min(display.width(), display.height()) / 2; i += 5) {
+    display.drawTriangle(display.width() / 2, display.height() / 2 - i,
+                         display.width() / 2 - i, display.height() / 2 + i,
+                         display.width() / 2 + i, display.height() / 2 + i, WHITE);
+    display.display();
+  }
+}
+
+void testfilltriangle(void) {
+  uint8_t color = WHITE;
+  for (int16_t i = min(display.width(), display.height()) / 2; i > 0; i -= 5) {
+    display.fillTriangle(display.width() / 2, display.height() / 2 - i,
+                         display.width() / 2 - i, display.height() / 2 + i,
+                         display.width() / 2 + i, display.height() / 2 + i, WHITE);
+    color = (color == WHITE) ? BLACK : WHITE;
+    display.display();
+  }
+}
+
+void testdrawroundrect(void) {
+  for (int16_t i = 0; i < display.height() / 2 - 2; i += 2) {
+    display.drawRoundRect(i, i, display.width() - 2 * i, display.height() - 2 * i, display.height() / 4, WHITE);
+    display.display();
+  }
+}
+
+void testfillroundrect(void) {
+  uint8_t color = WHITE;
+  for (int16_t i = 0; i < display.height() / 2 - 2; i += 2) {
+    display.fillRoundRect(i, i, display.width() - 2 * i, display.height() - 2 * i, display.height() / 4, color);
+    color = (color == WHITE) ? BLACK : WHITE;
+    display.display();
+  }
+}
+
+void testdrawrect(void) {
+  for (int16_t i = 0; i < display.height() / 2; i += 2) {
+    display.drawRect(i, i, display.width() - 2 * i, display.height() - 2 * i, WHITE);
+    display.display();
+  }
+}
+
+void testdrawline(void) {
+  for (int16_t i = 0; i < display.width(); i += 4) {
+    display.drawLine(0, 0, i, display.height() - 1, WHITE);
+    display.display();
+  }
+  for (int16_t i = 0; i < display.height(); i += 4) {
+    display.drawLine(0, 0, display.width() - 1, i, WHITE);
+    display.display();
+  }
+  delay(250);
+
+  display.clearDisplay();
+  for (int16_t i = 0; i < display.width(); i += 4) {
+    display.drawLine(0, display.height() - 1, i, 0, WHITE);
+    display.display();
+  }
+  for (int16_t i = display.height() - 1; i >= 0; i -= 4) {
+    display.drawLine(0, display.height() - 1, display.width() - 1, i, WHITE);
+    display.display();
+  }
+  delay(250);
+
+  display.clearDisplay();
+  for (int16_t i = display.width() - 1; i >= 0; i -= 4) {
+    display.drawLine(display.width() - 1, display.height() - 1, i, 0, WHITE);
+    display.display();
+  }
+  for (int16_t i = display.height() - 1; i >= 0; i -= 4) {
+    display.drawLine(display.width() - 1, display.height() - 1, 0, i, WHITE);
+    display.display();
+  }
+  delay(250);
+
+  display.clearDisplay();
+  for (int16_t i = 0; i < display.height(); i += 4) {
+    display.drawLine(display.width() - 1, 0, 0, i, WHITE);
+    display.display();
+  }
+  for (int16_t i = 0; i < display.width(); i += 4) {
+    display.drawLine(display.width() - 1, 0, i, display.height() - 1, WHITE);
+    display.display();
+  }
+  delay(250);
 }
