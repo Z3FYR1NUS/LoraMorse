@@ -1,4 +1,4 @@
-# LoRa Morse Link
+# LoRaMorse
 
 Two identical ESP32 stations that send Morse-code dots and dashes to each other over 433 MHz LoRa radio.
 
@@ -80,7 +80,7 @@ Attach a suitable **433 MHz antenna** before powering or transmitting with the L
 
 ### Buttons
 
-The firmware uses the ESP32’s internal pull-up resistors, so no extra resistor is needed for either button.
+The firmware uses the ESP32's internal pull-up resistors, so no extra resistor is needed for either button.
 
 | Button | One side | Other side | Job |
 |---|---|---|---|
@@ -123,7 +123,6 @@ lib_deps =
 
 monitor_speed = 115200
 ```
-
 
 ---
 
@@ -183,7 +182,6 @@ Check:
 - Both LoRa VCC pins are connected to **3V3**.
 - Both stations use the same firmware and the same `433E6` frequency setting.
 - NSS/CS goes to GPIO16, RESET to GPIO26, and DIO0 to GPIO25.
-
 
 ### Button presses do nothing
 
