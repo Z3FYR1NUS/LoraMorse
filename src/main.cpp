@@ -60,14 +60,6 @@ U8G2_SH1106_128X64_NONAME_F_HW_I2C display(
     U8X8_PIN_NONE
 );
 
-// -----------------------------------------------------------------------------
-// UI Layout Constants
-//
-// All spacing lives here so every panel shares the same margins, gutters and
-// padding instead of each draw function inventing its own offsets. This is
-// what previously caused the inconsistent card padding, the boxes butting
-// directly against the activity bar, and text touching frame walls.
-// -----------------------------------------------------------------------------
 
 constexpr int SCREEN_W = 128;
 constexpr int SCREEN_H = 64;
