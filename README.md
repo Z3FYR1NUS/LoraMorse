@@ -184,15 +184,6 @@ Check:
 - Both stations use the same firmware and the same `433E6` frequency setting.
 - NSS/CS goes to GPIO16, RESET to GPIO26, and DIO0 to GPIO25.
 
-### The compiler reports a `drawArc` error
-
-U8g2 `drawArc()` uses one radius value. The valid call has five arguments:
-
-```cpp
-display.drawArc(x + 5, y + 6, 5 + wave, 150, 234);
-```
-
-Do not use a version with two radius values.
 
 ### Button presses do nothing
 
