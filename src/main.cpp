@@ -1,832 +1,796 @@
+/*
+ * LORA-CW | ESP32 + SX1278 + SH1106 128 x 64
+ *
+ * Libraries: LoRa by Sandeep Mistry, U8g2 by olikraus, and the ESP32
+ * core's WiFi / ArduinoOTA libraries. Use an OTA-capable partition scheme.
+ *
+ * Controls:
+ *   KEY: dot below 250 ms, dash at/above 250 ms; 850 ms gap ends a letter.
+ *   CONTROL: tap to clear locally; hold 700 ms to send a word space.
+ *   Clearing closes a pending transmitted letter: sent marks cannot be undone.
+ *
+ * The original pins and one-byte '.', '-', '/', ' ' protocol are preserved.
+ * LoRa defaults are preserved, including CRC off, for the original peer.
+ * TX indicators mean local transmission, not acknowledged delivery.
+ * The buzzer is assumed to be ACTIVE / externally driven, as in the original.
+ * Set KEY_SIDETONE=false for receive-only audio. A passive piezo needs PWM.
+ *
+ * Display: 25 fps maximum, 400 kHz I2C, changed 8x8 tiles only; at most
+ * 32 display data bytes per loop. An extra 1024-byte shadow buffer tracks
+ * updates. Set OLED_I2C_HZ=100000 if your wiring/module needs a slower bus.
+ * Radio TX and WiFi connection waits are cooperative. Wire transfers, radio
+ * initialization and ArduinoOTA's actual flash update remain synchronous.
+ * During OTA, key/radio operation is suspended and all outputs are silenced.
+ *
+ * API references:
+ * https://github.com/sandeepmistry/arduino-LoRa/blob/master/API.md
+ * https://github.com/olikraus/u8g2/wiki/u8g2reference#updatedisplayarea
+ * https://github.com/espressif/arduino-esp32/tree/master/libraries/ArduinoOTA
+ */
+
 #include <Arduino.h>
 #include <SPI.h>
 #include <Wire.h>
+#define private public
 #include <LoRa.h>
+#undef private
 #include <U8g2lib.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 
-// ============================================================================
-// Network configuration
-// ============================================================================
-
-const char* WIFI_SSID    = "";
-const char* WIFI_PASS    = "";
+// Configuration -------------------------------------------------------------
+const char* WIFI_SSID = "";
+const char* WIFI_PASS = "";
 const char* OTA_HOSTNAME = "";
+const char* OTA_PASSWORD = "";  // Optional; empty preserves the original setup.
 
-constexpr unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
-constexpr unsigned long WIFI_RETRY_INTERVAL_MS  = 10000;
+constexpr long LORA_FREQUENCY = 433000000L;
+constexpr uint32_t OLED_I2C_HZ = 400000;
+constexpr bool KEY_SIDETONE = true;
 
-// ============================================================================
-// Radio & Morse timing
-// ============================================================================
+constexpr uint32_t DOT_DASH_SPLIT_MS = 250;
+constexpr uint32_t CHARACTER_PAUSE_MS = 850;
+constexpr uint32_t DEBOUNCE_MS = 8;
+constexpr uint32_t CONTROL_HOLD_MS = 700;
+constexpr uint32_t RX_STALE_MS = 10000;
+constexpr uint32_t TX_TIMEOUT_MS = 4000;  // Increase if using very slow RF settings.
+constexpr uint32_t TX_FLASH_MS = 120;
+constexpr uint32_t RX_FLASH_MS = 150;
+constexpr uint16_t BEEP_DOT_MS = 55;
+constexpr uint16_t BEEP_DASH_MS = 170;
+constexpr uint16_t BEEP_GAP_MS = 40;
+constexpr uint32_t UI_FRAME_MS = 40;
+constexpr uint32_t STATUS_HOLD_MS = 1500;
+constexpr uint32_t FOOTER_PAGE_MS = 5000;
+constexpr uint32_t WIFI_POLL_MS = 250;
+constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
+constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 10000;
 
-constexpr long     LORA_FREQUENCY      = 433E6;
+constexpr int LORA_SCK = 18, LORA_MISO = 19, LORA_MOSI = 23;
+constexpr int LORA_CS = 16, LORA_RST = 26, LORA_DIO0 = 25;
+constexpr int OLED_SDA = 21, OLED_SCL = 22;
+constexpr int BUZZER_PIN = 33, TX_LED_PIN = 32, RX_LED_PIN = 13;
+constexpr int KEY_PIN = 27, CONTROL_PIN = 14;
 
-constexpr uint16_t DOT_DASH_SPLIT_MS   = 250;
-constexpr uint16_t CHARACTER_PAUSE_MS  = 850;
+constexpr uint8_t SCREEN_W = 128, SCREEN_H = 64;
+constexpr uint8_t MAX_MARKS = 6;
+constexpr uint8_t LOG_COLS = 24, LOG_CAPACITY = 2 * LOG_COLS;
+constexpr uint8_t TX_QUEUE_SIZE = 32, BEEP_QUEUE_SIZE = 16;
+constexpr uint8_t TILES_X = SCREEN_W / 8, TILES_Y = SCREEN_H / 8;
+constexpr uint16_t TILE_COUNT = TILES_X * TILES_Y;
+constexpr uint8_t TILES_PER_TRANSFER = 4;
+constexpr size_t FRAME_BYTES = SCREEN_W * SCREEN_H / 8;
 
-constexpr uint16_t TX_FLASH_MS         = 90;
-constexpr uint16_t RX_FLASH_MS         = 120;
+U8G2_SH1106_128X64_NONAME_F_HW_I2C display(
+    U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
 
-constexpr uint16_t BEEP_DOT_MS         = 55;
-constexpr uint16_t BEEP_DASH_MS        = 170;
+// Small, fixed-size state objects --------------------------------------------
+struct Marks {
+    char text[MAX_MARKS + 1] = "";
+    uint8_t length = 0;
+    bool overflow = false;
 
-// ============================================================================
-// UI timing
-// ============================================================================
+    void clear() { length = 0; text[0] = '\0'; overflow = false; }
+    void append(char mark) {
+        if (length == MAX_MARKS) { overflow = true; return; }
+        text[length++] = mark;
+        text[length] = '\0';
+    }
+};
 
-constexpr uint16_t UI_FRAME_MS         = 40;
-constexpr uint16_t ACTIVITY_ANIM_MS    = 350;
-constexpr uint16_t STATUS_HOLD_MS      = 1500;
+struct Button {
+    int pin;
+    bool raw = false, down = false;
+    bool pressed = false, released = false;
+    uint32_t rawAt = 0, edgeAt = 0;
 
-// ============================================================================
-// GPIO map
-// ============================================================================
-
-// LoRa SX1278
-constexpr int LORA_SCK  = 18;
-constexpr int LORA_MISO = 19;
-constexpr int LORA_MOSI = 23;
-constexpr int LORA_CS   = 16;
-constexpr int LORA_RST  = 26;
-constexpr int LORA_DIO0 = 25;
-
-// OLED
-constexpr int OLED_SDA  = 21;
-constexpr int OLED_SCL  = 22;
-
-// User I/O
-constexpr int BUZZER_PIN   = 33;
-constexpr int TX_LED_PIN   = 32;
-constexpr int RX_LED_PIN   = 13;
-constexpr int KEY_PIN      = 27;
-constexpr int CONTROL_PIN  = 14;
-
-// ============================================================================
-// Display
-// ============================================================================
-
-U8G2_SH1106_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
-
-// ============================================================================
-// UI layout constants
-// ============================================================================
-
-constexpr int SCREEN_W = 128;
-constexpr int SCREEN_H = 64;
-
-constexpr int MARGIN   = 2;
-constexpr int GUTTER   = 2;
-constexpr int PADDING  = 2;
-
-constexpr int HEADER_H      = 10;
-constexpr int HEADER_TEXT_Y = 8;
-
-constexpr int CARD_Y  = 12;
-constexpr int CARD_H  = 16;
-constexpr int CARD_W  = (SCREEN_W - (2 * MARGIN) - GUTTER) / 2;
-
-constexpr int TX_CARD_X = MARGIN;
-constexpr int RX_CARD_X = TX_CARD_X + CARD_W + GUTTER;
-
-constexpr int DETAIL_Y = 36;
-
-constexpr int ACTIVITY_Y = 39;
-constexpr int ACTIVITY_H = 3;
-constexpr int ACTIVITY_X = MARGIN;
-constexpr int ACTIVITY_W = SCREEN_W - (2 * MARGIN);
-
-constexpr int LOG_BASELINE_Y = 52;
-
-constexpr int FOOTER_DIVIDER_Y  = 54;
-constexpr int FOOTER_BASELINE_Y = 62;
-
-// ============================================================================
-// Runtime state
-// ============================================================================
-
-char outgoingMarks[7]  = "";
-char receivedMarks[7]  = "";
-char receivedText[22]  = "";
-char statusText[20]    = "INITIALIZING";
-
-char lastTxChar = '-';
-char lastRxChar = '-';
-
-bool keyWasDown     = false;
-bool controlWasDown = false;
-
-bool radioReady    = false;
-bool wifiConnected = false;
-bool screenDirty   = true;
-
-bool txActivity = false;
-bool rxActivity = false;
-
-bool hasRssi = false;
-int  lastRssi = 0;
-
-unsigned long keyStartedAt     = 0;
-unsigned long lastMarkAt       = 0;
-
-unsigned long txLedUntil       = 0;
-unsigned long rxLedUntil       = 0;
-unsigned long buzzerUntil      = 0;
-
-unsigned long activityStartedAt = 0;
-unsigned long statusChangedAt   = 0;
-unsigned long lastUiFrameAt     = 0;
-unsigned long lastWifiRetryAt   = 0;
-
-// ============================================================================
-// Forward declarations
-// ============================================================================
-
-char decodeMorse(const char* marks);
-
-void appendMark(char* marks, char mark);
-void appendReceivedLetter(char letter);
-void setStatus(const char* text);
-
-void drawCenteredText(const char* text, int x, int y, int width);
-void drawRightAlignedText(const char* text, int rightEdge, int y);
-void drawFitText(const char* text, int x, int y, int width);
-
-void drawBootFrame(uint8_t percent, const char* label);
-void drawHeader();
-void drawBufferCards();
-void drawDetailStrip();
-void drawActivityBar();
-void drawConversationLog();
-void drawFooterStatus();
-void drawUi();
-void serviceDisplay();
-
-void sendToken(char token);
-void startTransmitActivity();
-void startReceiveActivity(char token);
-void finishOutgoingCharacter();
-
-void handleReceivedToken(char token);
-void checkRadio();
-void checkKey();
-void checkControl();
-void updateOutputs();
-
-void initWiFiAndOTA();
-void maintainWiFi();
-
-// ============================================================================
-// Morse decoder
-// ============================================================================
-
-char decodeMorse(const char* marks) {
-    struct MorseEntry {
-        const char* code;
-        char character;
-    };
-
-    static const MorseEntry table[] = {
-        {".-",    'A'}, {"-...",  'B'}, {"-.-.",  'C'}, {"-..",   'D'},
-        {".",     'E'}, {"..-.",  'F'}, {"--.",   'G'}, {"....",  'H'},
-        {"..",    'I'}, {".---",  'J'}, {"-.-",   'K'}, {".-..",  'L'},
-        {"--",    'M'}, {"-.",    'N'}, {"---",   'O'}, {".--.",  'P'},
-        {"--.-",  'Q'}, {".-.",   'R'}, {"...",   'S'}, {"-",     'T'},
-        {"..-",   'U'}, {"...-",  'V'}, {".--",   'W'}, {"-..-",  'X'},
-        {"-.--",  'Y'}, {"--..",  'Z'},
-        {"-----", '0'}, {".----", '1'}, {"..---", '2'}, {"...--", '3'},
-        {"....-", '4'}, {".....", '5'}, {"-....", '6'}, {"--...", '7'},
-        {"---..", '8'}, {"----.", '9'}
-    };
-
-    for (const MorseEntry& entry : table) {
-        if (strcmp(marks, entry.code) == 0) {
-            return entry.character;
+    explicit Button(int gpio) : pin(gpio) {}
+    void begin(uint32_t now) {
+        raw = down = (digitalRead(pin) == LOW);
+        rawAt = edgeAt = now;
+        pressed = released = false;
+    }
+    void update(uint32_t now) {
+        pressed = released = false;
+        const bool sample = digitalRead(pin) == LOW;
+        if (sample != raw) { raw = sample; rawAt = now; }
+        if (down != raw && uint32_t(now - rawAt) >= DEBOUNCE_MS) {
+            down = raw;
+            edgeAt = rawAt;  // Measure the observed edge, not the debounce delay.
+            pressed = down;
+            released = !down;
         }
     }
+};
 
-    return '?';
-}
+struct TxItem { char token; char decoded; };
 
-// ============================================================================
-// Buffer helpers
-// ============================================================================
+Marks outgoing, incoming;
+Button key(KEY_PIN), control(CONTROL_PIN);
+TxItem txQueue[TX_QUEUE_SIZE] = {}, inFlight = {};
+uint8_t txHead = 0, txTail = 0, txCount = 0;
+uint16_t beepQueue[BEEP_QUEUE_SIZE] = {};
+uint8_t beepHead = 0, beepTail = 0, beepCount = 0;
+char receivedText[LOG_CAPACITY + 1] = "";
+uint8_t receivedLength = 0;
+char lastTxChar = '\0', lastRxChar = '\0';
+char statusText[32] = "";
+char ipText[16] = "";
+bool radioReady = false, wifiConnected = false, wifiAttempting = false;
+bool otaStarted = false, otaActive = false;
+uint8_t otaPercent = 0;
+bool txBusy = false, txPulse = false, rxPulse = false;
+bool beepOn = false, beepGap = false, buzzerHigh = false;
+bool ignoreKeyUntilRelease = false, controlHandled = false;
+bool rxDiscarding = false, hasRssi = false;
+int lastRssi = 0;
+bool statusActive = false, footerShowsIp = false;
+bool screenDirty = true;
+uint8_t previousFrame[FRAME_BYTES] = {};
+uint16_t nextTile = TILE_COUNT;
+uint32_t keyStartedAt = 0, controlStartedAt = 0, lastMarkAt = 0;
+uint32_t lastRxMarkAt = 0, txStartedAt = 0, txPulseAt = 0, rxPulseAt = 0;
+uint32_t beepAt = 0, beepDuration = 0;
+uint32_t statusAt = 0, footerAt = 0, frameAt = 0;
+uint32_t wifiPollAt = 0, wifiAttemptAt = 0, wifiRetryAt = 0;
 
-void appendMark(char* marks, char mark) {
-    const size_t length = strlen(marks);
+// Explicit prototypes keep Arduino's sketch preprocessor away from custom types.
+char decodeMorse(const Marks& marks);
+void drawCard(int x, const char* label, const Marks& marks, char last, bool lit);
+void serviceDisplay(uint32_t now);
+void resetInputs(uint32_t now);
+void stopOutputs();
 
-    if (length >= 6) {
-        return;
+// Text and protocol helpers --------------------------------------------------
+char decodeMorse(const Marks& marks) {
+    if (!marks.length || marks.overflow || marks.length > 5) return '?';
+    // Binary Morse tree: start at 1; dot -> 2*i, dash -> 2*i+1.
+    static const char tree[] =
+        "??ETIANMSURWDKGOHVF?L?PJBXCYZQ??"
+        "54?3???2???????16???????7???8?90";
+    static_assert(sizeof(tree) == 65, "Morse tree must have 64 entries");
+    uint8_t index = 1;
+    for (uint8_t i = 0; i < marks.length; ++i) {
+        index = uint8_t(index * 2 + (marks.text[i] == '-'));
     }
-
-    marks[length]     = mark;
-    marks[length + 1] = '\0';
-}
-
-void appendReceivedLetter(char letter) {
-    const size_t length = strlen(receivedText);
-
-    if (length < sizeof(receivedText) - 1) {
-        receivedText[length]     = letter;
-        receivedText[length + 1] = '\0';
-        return;
-    }
-
-    // Rolling buffer: drop oldest character
-    memmove(receivedText, receivedText + 1, sizeof(receivedText) - 2);
-    receivedText[sizeof(receivedText) - 2] = letter;
-    receivedText[sizeof(receivedText) - 1] = '\0';
+    return tree[index];
 }
 
 void setStatus(const char* text) {
-    strncpy(statusText, text, sizeof(statusText) - 1);
-    statusText[sizeof(statusText) - 1] = '\0';
-    statusChangedAt = millis();
+    snprintf(statusText, sizeof(statusText), "%s", text);
+    statusAt = millis();
+    statusActive = true;
     screenDirty = true;
 }
 
-// ============================================================================
-// Display helpers
-// ============================================================================
-
-void drawCenteredText(const char* text, int x, int y, int width) {
-    const int textWidth = display.getStrWidth(text);
-    int textX = x + (width - textWidth) / 2;
-
-    if (textX < x) {
-        textX = x;
-    }
-
-    display.drawStr(textX, y, text);
-}
-
-void drawRightAlignedText(const char* text, int rightEdge, int y) {
-    const int textWidth = display.getStrWidth(text);
-    int textX = rightEdge - textWidth;
-
-    if (textX < 0) {
-        textX = 0;
-    }
-
-    display.drawStr(textX, y, text);
-}
-
-void drawFitText(const char* text, int x, int y, int width) {
-    char buffer[22];
-    strncpy(buffer, text, sizeof(buffer) - 1);
-    buffer[sizeof(buffer) - 1] = '\0';
-
-    while (strlen(buffer) > 1 && display.getStrWidth(buffer) > width) {
-        buffer[strlen(buffer) - 1] = '\0';
-    }
-
-    drawCenteredText(buffer, x, y, width);
-}
-
-// ============================================================================
-// Boot screen
-// ============================================================================
-
-void drawBootFrame(uint8_t percent, const char* label) {
-    display.clearBuffer();
-
-    display.setFont(u8g2_font_7x14B_tf);
-    drawCenteredText("LORA-CW", 0, 22, SCREEN_W);
-
-    display.setFont(u8g2_font_4x6_tf);
-    drawCenteredText(label, 0, 36, SCREEN_W);
-
-    constexpr int barX = 14;
-    constexpr int barY = 46;
-    constexpr int barW = SCREEN_W - (2 * barX);
-    constexpr int barH = 6;
-
-    display.drawFrame(barX, barY, barW, barH);
-
-    const int fillW = ((barW - 2) * percent) / 100;
-    if (fillW > 0) {
-        display.drawBox(barX + 1, barY + 1, fillW, barH - 2);
-    }
-
-    display.sendBuffer();
-}
-
-// ============================================================================
-// Main UI drawing
-// ============================================================================
-
-void drawHeader() {
-    display.setFont(u8g2_font_4x6_tf);
-    display.drawStr(MARGIN, HEADER_TEXT_Y, "LORA-CW");
-    drawRightAlignedText(
-        wifiConnected ? "WIFI OK" : "NO WIFI",
-        SCREEN_W - MARGIN,
-        HEADER_TEXT_Y
-    );
-    display.drawHLine(0, HEADER_H, SCREEN_W);
-}
-
-void drawBufferCards() {
-    const int labelY      = CARD_Y + 5;
-    const int contentY    = CARD_Y + 13;
-    const int contentWidth = CARD_W - (2 * PADDING);
-
-    // ---- TX card ----
-    display.drawRFrame(TX_CARD_X, CARD_Y, CARD_W, CARD_H, 2);
-
-    display.setFont(u8g2_font_4x6_tf);
-    display.drawStr(TX_CARD_X + PADDING, labelY, "TX");
-
-    display.setFont(u8g2_font_5x8_tf);
-
-    if (outgoingMarks[0]) {
-        drawFitText(outgoingMarks, TX_CARD_X + PADDING, contentY, contentWidth);
-    } else if (lastTxChar != '-') {
-        char txChar[2] = { lastTxChar, '\0' };
-        drawCenteredText(txChar, TX_CARD_X + PADDING, contentY, contentWidth);
-    } else {
-        drawCenteredText("READY", TX_CARD_X + PADDING, contentY, contentWidth);
-    }
-
-    // ---- RX card ----
-    display.drawRFrame(RX_CARD_X, CARD_Y, CARD_W, CARD_H, 2);
-
-    display.setFont(u8g2_font_4x6_tf);
-    display.drawStr(RX_CARD_X + PADDING, labelY, "RX");
-
-    display.setFont(u8g2_font_5x8_tf);
-
-    if (receivedMarks[0]) {
-        drawFitText(receivedMarks, RX_CARD_X + PADDING, contentY, contentWidth);
-    } else if (lastRxChar != '-') {
-        char rxChar[2] = { lastRxChar, '\0' };
-        drawCenteredText(rxChar, RX_CARD_X + PADDING, contentY, contentWidth);
-    } else {
-        drawCenteredText("WAIT", RX_CARD_X + PADDING, contentY, contentWidth);
-    }
-}
-
-void drawDetailStrip() {
-    display.setFont(u8g2_font_4x6_tf);
-
-    if (hasRssi) {
-        char rssiText[16];
-        snprintf(rssiText, sizeof(rssiText), "RSSI %d dBm", lastRssi);
-        display.drawStr(MARGIN, DETAIL_Y, rssiText);
-    } else {
-        display.drawStr(MARGIN, DETAIL_Y, "RSSI N/A");
-    }
-
-    char logText[16];
-    snprintf(
-        logText,
-        sizeof(logText),
-        "MSG %u/%u",
-        static_cast<unsigned>(strlen(receivedText)),
-        static_cast<unsigned>(sizeof(receivedText) - 1)
-    );
-    drawRightAlignedText(logText, SCREEN_W - MARGIN, DETAIL_Y);
-}
-
-void drawActivityBar() {
-    const unsigned long now = millis();
-    const bool active = txActivity || rxActivity;
-
-    display.drawFrame(ACTIVITY_X, ACTIVITY_Y, ACTIVITY_W, ACTIVITY_H);
-
-    if (!active) {
-        return;
-    }
-
-    const int trackWidth = ACTIVITY_W - 4;
-    if (trackWidth <= 0) {
-        return;
-    }
-
-    const unsigned long elapsed = now - activityStartedAt;
-    int progress;
-
-    if (elapsed >= ACTIVITY_ANIM_MS) {
-        progress = trackWidth - 2;
-    } else {
-        progress = static_cast<int>(
-            (elapsed * static_cast<unsigned long>(trackWidth - 2)) / ACTIVITY_ANIM_MS
-        );
-    }
-
-    if (progress < 0) {
-        progress = 0;
-    }
-    if (progress > trackWidth - 2) {
-        progress = trackWidth - 2;
-    }
-
-    display.drawBox(ACTIVITY_X + 1 + progress, ACTIVITY_Y + 1, 2, ACTIVITY_H - 2);
-}
-
-void drawConversationLog() {
-    display.setFont(u8g2_font_5x7_tf);
-
-    if (!receivedText[0]) {
-        drawCenteredText(
-            "NO MESSAGE YET",
-            MARGIN,
-            LOG_BASELINE_Y,
-            SCREEN_W - (2 * MARGIN)
-        );
-        return;
-    }
-
-    drawFitText(receivedText, MARGIN, LOG_BASELINE_Y, SCREEN_W - (2 * MARGIN));
-}
-
-void drawFooterStatus() {
-    const unsigned long now = millis();
-
-    display.drawHLine(0, FOOTER_DIVIDER_Y, SCREEN_W);
-    display.setFont(u8g2_font_4x6_tf);
-
-    const bool statusVisible =
-        statusText[0] && (now - statusChangedAt < STATUS_HOLD_MS);
-
-    if (statusVisible) {
-        display.drawStr(MARGIN, FOOTER_BASELINE_Y, statusText);
-    } else if (!radioReady) {
-        display.drawStr(MARGIN, FOOTER_BASELINE_Y, "RADIO OFFLINE");
-    } else if (keyWasDown) {
-        display.drawStr(MARGIN, FOOTER_BASELINE_Y, "KEY DOWN");
-    } else {
-        display.drawStr(MARGIN, FOOTER_BASELINE_Y, "KEY READY");
-    }
-
-    if (wifiConnected) {
-        const String ip = WiFi.localIP().toString();
-        drawRightAlignedText(ip.c_str(), SCREEN_W - MARGIN, FOOTER_BASELINE_Y);
-    } else {
-        drawRightAlignedText("433 MHz", SCREEN_W - MARGIN, FOOTER_BASELINE_Y);
-    }
-}
-
-void drawUi() {
-    display.clearBuffer();
-
-    drawHeader();
-    drawBufferCards();
-    drawDetailStrip();
-    drawActivityBar();
-    drawConversationLog();
-    drawFooterStatus();
-
-    display.sendBuffer();
-    screenDirty = false;
-}
-
-void serviceDisplay() {
-    const unsigned long now = millis();
-    bool active = txActivity || rxActivity;
-
-    if (active && now - activityStartedAt >= ACTIVITY_ANIM_MS) {
-        txActivity = false;
-        rxActivity = false;
-        screenDirty = true;
-        active = false;
-    }
-
-    if (screenDirty || (active && now - lastUiFrameAt >= UI_FRAME_MS)) {
-        drawUi();
-        lastUiFrameAt = now;
-    }
-}
-
-// ============================================================================
-// LoRa helpers
-// ============================================================================
-
-void sendToken(char token) {
-    if (!radioReady) {
-        return;
-    }
-
-    LoRa.beginPacket();
-    LoRa.write(static_cast<uint8_t>(token));
-    LoRa.endPacket();
-}
-
-void startTransmitActivity() {
-    digitalWrite(TX_LED_PIN, HIGH);
-    txLedUntil = millis() + TX_FLASH_MS;
-
-    txActivity = true;
-    rxActivity = false;
-    activityStartedAt = millis();
-    screenDirty = true;
-}
-
-void startReceiveActivity(char token) {
-    digitalWrite(RX_LED_PIN, HIGH);
-    rxLedUntil = millis() + RX_FLASH_MS;
-
-    digitalWrite(BUZZER_PIN, HIGH);
-    buzzerUntil = millis() + (token == '-' ? BEEP_DASH_MS : BEEP_DOT_MS);
-
-    rxActivity = true;
-    txActivity = false;
-    activityStartedAt = millis();
-    screenDirty = true;
-}
-
-void finishOutgoingCharacter() {
-    if (!outgoingMarks[0]) {
-        return;
-    }
-
-    const char decoded = decodeMorse(outgoingMarks);
-    lastTxChar = decoded;
-
-    sendToken('/');
-    startTransmitActivity();
-
-    outgoingMarks[0] = '\0';
-
-    char message[16];
-    snprintf(message, sizeof(message), "TX: %c", decoded);
+void letterStatus(const char* prefix, char letter) {
+    char message[32];
+    snprintf(message, sizeof(message), "%s %c", prefix, letter);
     setStatus(message);
 }
 
-void handleReceivedToken(char token) {
-    if (token == '.' || token == '-') {
-        appendMark(receivedMarks, token);
-        setStatus(token == '.' ? "RX DOT" : "RX DASH");
-        startReceiveActivity(token);
+void appendReceivedLetter(char letter) {
+    if (receivedLength == LOG_CAPACITY) {
+        memmove(receivedText, receivedText + 1, LOG_CAPACITY - 1);
+        --receivedLength;
     }
-    else if (token == '/' && receivedMarks[0]) {
-        const char decoded = decodeMorse(receivedMarks);
-        lastRxChar = decoded;
-        appendReceivedLetter(decoded);
-        receivedMarks[0] = '\0';
-
-        char message[16];
-        snprintf(message, sizeof(message), "RX: %c", decoded);
-        setStatus(message);
-    }
-    else if (token == ' ') {
-        lastRxChar = ' ';
-        appendReceivedLetter(' ');
-        setStatus("RX SPACE");
-    }
-
+    receivedText[receivedLength++] = letter;
+    receivedText[receivedLength] = '\0';
     screenDirty = true;
 }
 
-void checkRadio() {
-    const int packetSize = LoRa.parsePacket();
-    if (!packetSize) {
-        return;
-    }
-
-    const char token = static_cast<char>(LoRa.read());
-    lastRssi = LoRa.packetRssi();
-    hasRssi = true;
-
-    // Drain any remaining bytes
-    while (LoRa.available()) {
-        LoRa.read();
-    }
-
-    handleReceivedToken(token);
+bool queueToken(char token, char decoded, bool reserveDelimiter) {
+    if (!radioReady) { setStatus("RADIO OFFLINE"); return false; }
+    // A mark always leaves room for its terminating slash.
+    const uint8_t limit = TX_QUEUE_SIZE - (reserveDelimiter ? 1 : 0);
+    if (txCount >= limit) { setStatus("TX QUEUE FULL"); return false; }
+    txQueue[txTail] = {token, decoded};
+    txTail = uint8_t((txTail + 1) % TX_QUEUE_SIZE);
+    ++txCount;
+    screenDirty = true;
+    return true;
 }
 
-// ============================================================================
-// Input handling
-// ============================================================================
-
-void checkKey() {
-    const unsigned long now = millis();
-    const bool keyDown = digitalRead(KEY_PIN) == LOW;
-
-    if (keyDown && !keyWasDown) {
-        keyStartedAt = now;
-        setStatus("KEY DOWN");
-    }
-
-    if (!keyDown && keyWasDown) {
-        const unsigned long duration = now - keyStartedAt;
-        const char mark = (duration < DOT_DASH_SPLIT_MS) ? '.' : '-';
-
-        appendMark(outgoingMarks, mark);
-        sendToken(mark);
-        startTransmitActivity();
-        lastMarkAt = now;
-
-        setStatus(mark == '.' ? "TX DOT" : "TX DASH");
-    }
-
-    keyWasDown = keyDown;
-
-    // Character timeout
-    if (!keyDown && outgoingMarks[0] && now - lastMarkAt >= CHARACTER_PAUSE_MS) {
-        finishOutgoingCharacter();
-    }
+bool finishOutgoingCharacter() {
+    if (!outgoing.length) return true;
+    const char decoded = decodeMorse(outgoing);
+    if (!queueToken('/', decoded, false)) return false;
+    outgoing.clear();
+    letterStatus("QUEUED", decoded);
+    return true;
 }
 
-void checkControl() {
-    const bool controlDown = digitalRead(CONTROL_PIN) == LOW;
-
-    if (controlDown && !controlWasDown) {
-        outgoingMarks[0] = '\0';
-        receivedMarks[0] = '\0';
-        receivedText[0]  = '\0';
-
-        lastTxChar = '-';
-        lastRxChar = '-';
-
-        hasRssi  = false;
-        lastRssi = 0;
-
-        setStatus("BUFFER CLEARED");
-    }
-
-    controlWasDown = controlDown;
+void sendWordSpace() {
+    if (!radioReady) { setStatus("RADIO OFFLINE"); return; }
+    const uint8_t needed = outgoing.length ? 2 : 1;
+    if (TX_QUEUE_SIZE - txCount < needed) { setStatus("TX QUEUE FULL"); return; }
+    if (!finishOutgoingCharacter()) return;
+    if (queueToken(' ', ' ', false)) setStatus("SPACE QUEUED");
 }
 
-// ============================================================================
-// Output timers (LEDs & buzzer)
-// ============================================================================
-
-void updateOutputs() {
-    const unsigned long now = millis();
-
-    if (txLedUntil && now >= txLedUntil) {
-        digitalWrite(TX_LED_PIN, LOW);
-        txLedUntil = 0;
-    }
-
-    if (rxLedUntil && now >= rxLedUntil) {
-        digitalWrite(RX_LED_PIN, LOW);
-        rxLedUntil = 0;
-    }
-
-    if (buzzerUntil && now >= buzzerUntil) {
-        digitalWrite(BUZZER_PIN, LOW);
-        buzzerUntil = 0;
-    }
+void clearBuffers() {
+    // Close the remote letter before discarding local TX state.
+    if (!finishOutgoingCharacter()) return;
+    rxDiscarding = rxDiscarding || incoming.length != 0;
+    incoming.clear();
+    receivedLength = 0;
+    receivedText[0] = '\0';
+    lastTxChar = lastRxChar = '\0';
+    hasRssi = false;
+    if (key.down || key.raw) ignoreKeyUntilRelease = true;
+    setStatus("BUFFERS CLEARED");
 }
 
-// ============================================================================
-// Wi-Fi & ArduinoOTA
-// ============================================================================
+void queueBeep(char token) {
+    if (beepCount == BEEP_QUEUE_SIZE) return;  // Audio never blocks RF processing.
+    beepQueue[beepTail] = token == '-' ? BEEP_DASH_MS : BEEP_DOT_MS;
+    beepTail = uint8_t((beepTail + 1) % BEEP_QUEUE_SIZE);
+    ++beepCount;
+}
 
-void initWiFiAndOTA() {
-    WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);
-    WiFi.disconnect(true);
-    delay(100);
-
-    Serial.print("[WiFi] Connecting to \"");
-    Serial.print(WIFI_SSID);
-    Serial.println("\"...");
-
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-    const unsigned long startAttempt = millis();
-    while (WiFi.status() != WL_CONNECTED &&
-           millis() - startAttempt < WIFI_CONNECT_TIMEOUT_MS) {
-        delay(250);
-        Serial.print(".");
+void finishReceivedCharacter() {
+    if (!rxDiscarding && incoming.length) {
+        lastRxChar = decodeMorse(incoming);
+        appendReceivedLetter(lastRxChar);
+        letterStatus("RX", lastRxChar);
     }
-    Serial.println();
+    incoming.clear();
+    rxDiscarding = false;
+}
 
-    if (WiFi.status() == WL_CONNECTED) {
-        wifiConnected = true;
-        Serial.print("[WiFi] Connected. IP: ");
-        Serial.println(WiFi.localIP());
+void handleReceivedToken(char token, uint32_t now) {
+    if (token != '.' && token != '-' && token != '/' && token != ' ') return;
+    rxPulse = true;
+    rxPulseAt = now;
+    digitalWrite(RX_LED_PIN, HIGH);
+    if (token == '.' || token == '-') {
+        lastRxMarkAt = now;
+        if (!rxDiscarding) incoming.append(token);
+        queueBeep(token);
+        setStatus(token == '.' ? "RX DOT" : "RX DASH");
     } else {
-        Serial.print("[WiFi] Failed. status()=");
-        Serial.println(WiFi.status());
+        // Space is also a boundary if the preceding slash was lost.
+        finishReceivedCharacter();
+        if (token == ' ') {
+            lastRxChar = ' ';
+            appendReceivedLetter(' ');
+            setStatus("RX SPACE");
+        }
     }
+    screenDirty = true;
+}
 
-    ArduinoOTA.setHostname(OTA_HOSTNAME);
+void radioFailure(const char* message) {
+    LoRa.idle();
+    radioReady = false;
+    txBusy = false;
+    txCount = txHead = txTail = 0;
+    outgoing.clear();
+    txPulse = false;
+    digitalWrite(TX_LED_PIN, LOW);
+    setStatus(message);
+    Serial.println(message);
+}
 
-    ArduinoOTA.onStart([]() {
-        setStatus("OTA STARTING");
-        serviceDisplay();
-        Serial.println("[OTA] Update starting...");
-    });
-
-    ArduinoOTA.onEnd([]() {
-        setStatus("OTA COMPLETE");
-        serviceDisplay();
-        Serial.println("[OTA] Update complete.");
-    });
-
-    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-        if (total == 0) {
+void serviceRadio(uint32_t now) {
+    if (!radioReady || otaActive) return;
+    if (txBusy) {
+        if (LoRa.isTransmitting()) {
+            if (uint32_t(now - txStartedAt) >= TX_TIMEOUT_MS) radioFailure("TX TIMEOUT");
             return;
         }
-        const unsigned int percent = (progress * 100U) / total;
-        char buffer[20];
-        snprintf(buffer, sizeof(buffer), "OTA: %u%%", percent);
-        setStatus(buffer);
-        serviceDisplay();
-    });
+        txBusy = false;
+        if (inFlight.token == '/' && inFlight.decoded) {
+            lastTxChar = inFlight.decoded;
+            letterStatus("SENT", lastTxChar);
+        } else if (inFlight.token == ' ') {
+            lastTxChar = ' ';
+            setStatus("SPACE SENT");
+        }
+        screenDirty = true;
+    }
 
-    ArduinoOTA.onError([](ota_error_t error) {
-        setStatus("OTA ERROR");
-        serviceDisplay();
-        Serial.print("[OTA] Error: ");
-        Serial.println(error);
-    });
-
-    ArduinoOTA.begin();
-    Serial.println("[OTA] Ready.");
+    // parsePacket changes radio mode: NEVER call it while async TX is running.
+    const int packetSize = LoRa.parsePacket();
+    if (packetSize > 0) {
+        lastRssi = LoRa.packetRssi();
+        hasRssi = true;
+        while (LoRa.available()) {
+            const int value = LoRa.read();
+            if (value >= 0) handleReceivedToken(char(value), now);
+        }
+        screenDirty = true;
+        if (!txCount) LoRa.parsePacket();  // Re-arm single RX after consuming FIFO.
+    }
+    if (!txCount) return;
+    if (!LoRa.beginPacket()) return;
+    const TxItem item = txQueue[txHead];
+    if (LoRa.write(uint8_t(item.token)) != 1 || !LoRa.endPacket(true)) {
+        radioFailure("TX START FAILED");
+        return;
+    }
+    inFlight = item;
+    txHead = uint8_t((txHead + 1) % TX_QUEUE_SIZE);
+    --txCount;
+    txBusy = txPulse = true;
+    txStartedAt = txPulseAt = millis();
+    digitalWrite(TX_LED_PIN, HIGH);
+    screenDirty = true;
 }
 
-void maintainWiFi() {
-    if (WiFi.status() == WL_CONNECTED) {
-        if (!wifiConnected) {
+// Inputs and output timers ---------------------------------------------------
+void resetInputs(uint32_t now) {
+    key.begin(now);
+    control.begin(now);
+    ignoreKeyUntilRelease = key.down;
+    controlHandled = control.down;
+}
+
+void serviceInputs(uint32_t now) {
+    key.update(now);
+    control.update(now);
+    if (key.pressed && !ignoreKeyUntilRelease) {
+        // Catch a new press that starts just after the letter-gap boundary.
+        if (outgoing.length && uint32_t(key.edgeAt - lastMarkAt) >= CHARACTER_PAUSE_MS)
+            finishOutgoingCharacter();
+        keyStartedAt = key.edgeAt;
+        screenDirty = true;
+    }
+    if (key.released) {
+        if (ignoreKeyUntilRelease) {
+            ignoreKeyUntilRelease = false;
+        } else {
+            const uint32_t duration = key.edgeAt - keyStartedAt;
+            const char mark = duration < DOT_DASH_SPLIT_MS ? '.' : '-';
+            if (queueToken(mark, '\0', true)) {
+                outgoing.append(mark);
+                lastMarkAt = key.edgeAt;
+                setStatus(outgoing.overflow ? "TOO MANY MARKS" :
+                          (mark == '.' ? "TX DOT" : "TX DASH"));
+            }
+        }
+        screenDirty = true;
+    }
+
+    if (control.pressed) {
+        controlStartedAt = control.edgeAt;
+        controlHandled = false;
+        screenDirty = true;
+    }
+    if (control.down && !controlHandled &&
+        uint32_t(now - controlStartedAt) >= CONTROL_HOLD_MS) {
+        controlHandled = true;
+        if (key.down || key.raw) setStatus("RELEASE KEY FIRST");
+        else sendWordSpace();
+    }
+    if (control.released) {
+        if (!controlHandled) clearBuffers();
+        screenDirty = true;
+    }
+    // raw prevents finalizing during a press that is still being debounced.
+    if (!key.down && !key.raw && outgoing.length &&
+        uint32_t(now - lastMarkAt) >= CHARACTER_PAUSE_MS) finishOutgoingCharacter();
+}
+
+void stopOutputs() {
+    txPulse = rxPulse = beepOn = beepGap = buzzerHigh = false;
+    beepCount = beepHead = beepTail = 0;
+    digitalWrite(TX_LED_PIN, LOW);
+    digitalWrite(RX_LED_PIN, LOW);
+    digitalWrite(BUZZER_PIN, LOW);
+}
+
+void serviceOutputs(uint32_t now) {
+    if (txPulse && uint32_t(now - txPulseAt) >= TX_FLASH_MS && !txBusy) {
+        txPulse = false;
+        digitalWrite(TX_LED_PIN, LOW);
+        screenDirty = true;
+    }
+    if (rxPulse && uint32_t(now - rxPulseAt) >= RX_FLASH_MS) {
+        rxPulse = false;
+        digitalWrite(RX_LED_PIN, LOW);
+        screenDirty = true;
+    }
+    if (beepOn && uint32_t(now - beepAt) >= beepDuration) {
+        beepOn = false;
+        beepGap = true;
+        beepAt = now;
+    }
+    if (beepGap && uint32_t(now - beepAt) >= BEEP_GAP_MS) beepGap = false;
+    if (!beepOn && !beepGap && beepCount) {
+        beepDuration = beepQueue[beepHead];
+        beepHead = uint8_t((beepHead + 1) % BEEP_QUEUE_SIZE);
+        --beepCount;
+        beepAt = now;
+        beepOn = true;
+    }
+    const bool sound = !otaActive &&
+        (beepOn || (KEY_SIDETONE && key.down && !ignoreKeyUntilRelease));
+    if (sound != buzzerHigh) {
+        buzzerHigh = sound;
+        digitalWrite(BUZZER_PIN, sound ? HIGH : LOW);
+    }
+}
+
+void serviceTimers(uint32_t now) {
+    if (statusActive && uint32_t(now - statusAt) >= STATUS_HOLD_MS) {
+        statusActive = false;
+        screenDirty = true;  // Explicit expiry redraw, even when otherwise idle.
+    }
+    if (uint32_t(now - footerAt) >= FOOTER_PAGE_MS) {
+        footerAt = now;
+        footerShowsIp = !footerShowsIp;
+        screenDirty = true;
+    }
+    if ((incoming.length || rxDiscarding) &&
+        uint32_t(now - lastRxMarkAt) >= RX_STALE_MS) {
+        incoming.clear();
+        rxDiscarding = false;
+        setStatus("RX GAP / LOST END");
+    }
+}
+
+// 128 x 64 UI ---------------------------------------------------------------
+void centered(const char* text, int x, int baseline, int width) {
+    const int textWidth = display.getStrWidth(text);
+    display.drawStr(x + (width > textWidth ? (width - textWidth) / 2 : 0), baseline, text);
+}
+
+void drawBars(int x, int bottom, uint8_t count) {
+    for (uint8_t i = 0; i < 4; ++i) {
+        const uint8_t height = uint8_t(1 + i * 2);
+        if (i < count) display.drawBox(x + i * 3, bottom - height + 1, 2, height);
+        else display.drawPixel(x + i * 3, bottom);
+    }
+}
+
+void drawHeader() {
+    display.setFont(u8g2_font_4x6_tf);
+    display.drawStr(2, 7, "LORA-CW");
+    display.drawStr(38, 7, radioReady ? "433" : "RF!");
+    if (hasRssi) {
+        char rssi[8];
+        snprintf(rssi, sizeof(rssi), "%d", lastRssi);
+        // Relative strength indicator, not a calibrated link-quality estimate.
+        const uint8_t bars = lastRssi >= -75 ? 4 : lastRssi >= -90 ? 3 :
+                             lastRssi >= -105 ? 2 : 1;
+        drawBars(57, 7, bars);
+        display.drawStr(72, 7, rssi);
+    } else display.drawStr(58, 7, "RX --");
+    display.drawStr(105, 7, "W");
+    if (wifiConnected) drawBars(114, 7, 4);
+    else if (wifiAttempting) drawBars(114, 7, 1 + (millis() / 250) % 4);
+    else {
+        display.drawLine(116, 2, 122, 7);
+        display.drawLine(122, 2, 116, 7);
+    }
+    display.drawHLine(0, 9, SCREEN_W);
+}
+
+void drawCard(int x, const char* label, const Marks& marks, char last, bool lit) {
+    display.drawRFrame(x, 12, 61, 24, 2);
+    if (lit) display.drawRBox(x + 3, 14, 13, 7, 1);
+    display.setFont(u8g2_font_4x6_tf);
+    display.setDrawColor(lit ? 0 : 1);
+    display.drawStr(x + 5, 20, label);
+    display.setDrawColor(1);
+    if (marks.length) {
+        int markX = x + 4;
+        for (uint8_t i = 0; i < marks.length; ++i) {
+            const uint8_t width = marks.text[i] == '-' ? 4 : 2;
+            display.drawBox(markX, 29, width, 2);
+            markX += width + 2;
+        }
+    } else {
+        display.drawStr(x + 4, 31, last ? "LAST" : (label[0] == 'T' ? "READY" : "WAIT"));
+    }
+    const char candidate = marks.length ? decodeMorse(marks) : last;
+    if (candidate == ' ') {
+        display.setFont(u8g2_font_5x7_tf);
+        centered("SP", x + 40, 31, 18);
+    } else if (candidate) {
+        char text[2] = {candidate, '\0'};
+        display.setFont(u8g2_font_logisoso16_tf);
+        // Clip to this card's letter region, even if a replacement font is wider.
+        display.setClipWindow(x + 40, 13, x + 60, 35);
+        centered(text, x + 40, 33, 19);
+        display.setMaxClipWindow();
+    } else display.drawHLine(x + 47, 27, 6);
+}
+
+void drawProgress(uint32_t now) {
+    display.drawHLine(2, 39, 124);
+    uint32_t elapsed = 0, total = 1;
+    bool visible = true;
+    if (control.down && !controlHandled) {
+        elapsed = now - controlStartedAt; total = CONTROL_HOLD_MS;
+    } else if (key.down && !ignoreKeyUntilRelease) {
+        elapsed = now - keyStartedAt; total = DOT_DASH_SPLIT_MS;
+    } else if (outgoing.length) {
+        elapsed = now - lastMarkAt; total = CHARACTER_PAUSE_MS;
+    } else visible = false;
+    if (visible) {
+        if (elapsed > total) elapsed = total;
+        const uint8_t width = uint8_t(elapsed * 124UL / total);
+        if (width) display.drawBox(2, 37, width, 2);
+    }
+}
+
+void drawLog() {
+    display.setFont(u8g2_font_5x7_tf);
+    if (!receivedLength) {
+        centered("NO MESSAGE YET", 2, 47, 124);
+        display.setFont(u8g2_font_4x6_tf);
+        centered("KEY TO SEND", 2, 54, 124);
+        return;
+    }
+    for (uint8_t row = 0; row < 2; ++row) {
+        const uint8_t offset = row * LOG_COLS;
+        if (offset >= receivedLength) break;
+        uint8_t count = receivedLength - offset;
+        if (count > LOG_COLS) count = LOG_COLS;
+        char line[LOG_COLS + 1];
+        memcpy(line, receivedText + offset, count);
+        line[count] = '\0';
+        display.drawStr(2, 47 + row * 7, line);
+    }
+}
+
+void drawFooter(uint32_t now) {
+    display.drawHLine(0, 56, SCREEN_W);
+    display.setFont(u8g2_font_4x6_tf);
+    char text[32];
+    if (!radioReady) snprintf(text, sizeof(text), "RADIO OFFLINE - CHECK WIRING");
+    else if (control.down && !controlHandled) snprintf(text, sizeof(text), "HOLD: SPACE / TAP: CLEAR");
+    else if (key.down && !ignoreKeyUntilRelease) {
+        const uint32_t duration = now - keyStartedAt;
+        snprintf(text, sizeof(text), "%s  %lums", duration < DOT_DASH_SPLIT_MS ? "DOT" : "DASH",
+                 static_cast<unsigned long>(duration));
+    } else if (statusActive) snprintf(text, sizeof(text), "%s", statusText);
+    else if (txCount || txBusy) snprintf(text, sizeof(text), "SENDING  %u QUEUED", unsigned(txCount));
+    else if (footerShowsIp && wifiConnected) snprintf(text, sizeof(text), "IP %s", ipText);
+    else snprintf(text, sizeof(text), "CTRL: TAP CLEAR / HOLD SPACE");
+    // A single full-width lane prevents status/IP overlap.
+    centered(text, 2, 63, 124);
+}
+
+void drawUi(uint32_t now) {
+    display.clearBuffer();
+    display.setDrawColor(1);
+    display.setFontMode(1);
+    drawHeader();
+    drawCard(2, "TX", outgoing, lastTxChar, txPulse || (key.down && !ignoreKeyUntilRelease));
+    drawCard(65, "RX", incoming, lastRxChar, rxPulse);
+    drawProgress(now);
+    drawLog();
+    drawFooter(now);
+}
+
+void flushDisplayStep() {
+    const uint8_t* buffer = display.getBufferPtr();
+    // One short contiguous tile run per loop; key and RF get serviced between runs.
+    while (nextTile < TILE_COUNT) {
+        const uint16_t start = nextTile;
+        if (!memcmp(buffer + start * 8, previousFrame + start * 8, 8)) {
+            ++nextTile;
+            continue;
+        }
+        uint8_t count = 1;
+        while (count < TILES_PER_TRANSFER && start + count < TILE_COUNT &&
+               (start + count) / TILES_X == start / TILES_X &&
+               memcmp(buffer + (start + count) * 8, previousFrame + (start + count) * 8, 8)) {
+            ++count;
+        }
+        display.updateDisplayArea(start % TILES_X, start / TILES_X, count, 1);
+        memcpy(previousFrame + start * 8, buffer + start * 8, count * 8);
+        nextTile += count;
+        return;
+    }
+}
+
+void serviceDisplay(uint32_t now) {
+    if (otaActive) return;
+    if (nextTile < TILE_COUNT) { flushDisplayStep(); return; }
+    const bool animated = (key.down && !ignoreKeyUntilRelease) || outgoing.length ||
+                          (control.down && !controlHandled) || wifiAttempting;
+    if ((!screenDirty && !animated) || uint32_t(now - frameAt) < UI_FRAME_MS) return;
+    drawUi(now);
+    screenDirty = false;
+    frameAt = now;
+    nextTile = 0;
+    flushDisplayStep();
+}
+
+void drawOtaScreen(const char* label) {
+    display.clearBuffer();
+    display.setDrawColor(1);
+    display.setFont(u8g2_font_5x7_tf);
+    centered(label, 0, 15, 128);
+    char percent[8];
+    snprintf(percent, sizeof(percent), "%u%%", unsigned(otaPercent));
+    display.setFont(u8g2_font_logisoso16_tf);
+    centered(percent, 0, 39, 128);
+    display.drawFrame(10, 47, 108, 7);
+    const uint8_t fill = uint8_t(106UL * otaPercent / 100);
+    if (fill) display.drawBox(11, 48, fill, 5);
+    display.setFont(u8g2_font_4x6_tf);
+    centered("KEEP POWER ON", 0, 63, 128);
+    // Full frames are appropriate here: normal key/radio work is suspended.
+    display.sendBuffer();
+    memcpy(previousFrame, display.getBufferPtr(), FRAME_BYTES);
+    nextTile = TILE_COUNT;
+    frameAt = millis();
+}
+
+// WiFi and OTA --------------------------------------------------------------
+void configureOTA() {
+    ArduinoOTA.setHostname(OTA_HOSTNAME);
+    if (OTA_PASSWORD[0]) ArduinoOTA.setPassword(OTA_PASSWORD);
+    ArduinoOTA.onStart([]() {
+        otaActive = true;
+        otaPercent = 0;
+        stopOutputs();
+        txCount = txHead = txTail = 0;
+        txBusy = false;
+        outgoing.clear();
+        incoming.clear();
+        rxDiscarding = false;
+        if (radioReady) LoRa.idle();
+        drawOtaScreen("UPDATING FIRMWARE");
+        Serial.println("[OTA] Starting");
+    });
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+        if (!total) return;
+        uint32_t percent = uint32_t(uint64_t(progress) * 100ULL / total);
+        if (percent > 100) percent = 100;
+        if (percent == otaPercent) return;
+        otaPercent = uint8_t(percent);
+        if (uint32_t(millis() - frameAt) >= 100 || otaPercent == 100)
+            drawOtaScreen("UPDATING FIRMWARE");
+    });
+    ArduinoOTA.onEnd([]() {
+        otaPercent = 100;
+        drawOtaScreen("UPDATE COMPLETE");
+        Serial.println("[OTA] Complete; restarting");
+        // Leave otaActive true: the library reboots after this callback.
+    });
+    ArduinoOTA.onError([](ota_error_t error) {
+        const bool interrupted = otaActive;
+        otaActive = false;
+        if (interrupted) {
+            resetInputs(millis());
+            if (radioReady) queueToken('/', '\0', false);  // Restore the peer's boundary.
+        }
+        char message[32];
+        snprintf(message, sizeof(message), "OTA ERROR %u", unsigned(error));
+        setStatus(message);
+        Serial.println(message);
+    });
+}
+
+void startWiFiAttempt(uint32_t now) {
+    wifiAttempting = true;
+    wifiAttemptAt = now;
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    screenDirty = true;
+    Serial.println("[WiFi] Connecting in background");
+}
+
+void maintainWiFi(uint32_t now) {
+    if (uint32_t(now - wifiPollAt) < WIFI_POLL_MS) return;
+    wifiPollAt = now;
+    const bool connected = WiFi.status() == WL_CONNECTED;
+    if (connected) {
+        const IPAddress ip = WiFi.localIP();
+        char currentIp[16];
+        snprintf(currentIp, sizeof(currentIp), "%u.%u.%u.%u",
+                 unsigned(ip[0]), unsigned(ip[1]), unsigned(ip[2]), unsigned(ip[3]));
+        if (!wifiConnected || strcmp(currentIp, ipText)) {
             wifiConnected = true;
-            Serial.print("[WiFi] Reconnected. IP: ");
-            Serial.println(WiFi.localIP());
+            wifiAttempting = false;
+            snprintf(ipText, sizeof(ipText), "%s", currentIp);
+            if (otaStarted) ArduinoOTA.end();
+            ArduinoOTA.begin();  // Start only after the interface has connected.
+            otaStarted = true;
             screenDirty = true;
+            Serial.print("[WiFi] IP: "); Serial.println(ipText);
         }
         return;
     }
-
     if (wifiConnected) {
         wifiConnected = false;
+        ipText[0] = '\0';
+        if (otaStarted) ArduinoOTA.end();
+        otaStarted = false;
+        wifiAttempting = false;
+        wifiRetryAt = now;
         screenDirty = true;
-        Serial.println("[WiFi] Connection lost.");
+        Serial.println("[WiFi] Connection lost");
     }
-
-    const unsigned long now = millis();
-    if (now - lastWifiRetryAt >= WIFI_RETRY_INTERVAL_MS) {
-        lastWifiRetryAt = now;
-        Serial.println("[WiFi] Retrying connection...");
-        WiFi.begin(WIFI_SSID, WIFI_PASS);
+    if (wifiAttempting && uint32_t(now - wifiAttemptAt) >= WIFI_CONNECT_TIMEOUT_MS) {
+        WiFi.disconnect(false, false);
+        wifiAttempting = false;
+        wifiRetryAt = now;
+        screenDirty = true;
+        Serial.println("[WiFi] Attempt timed out; Morse remains available");
+    } else if (!wifiAttempting && uint32_t(now - wifiRetryAt) >= WIFI_RETRY_INTERVAL_MS) {
+        startWiFiAttempt(now);
     }
 }
 
-// ============================================================================
-// Setup
-// ============================================================================
-
+// Entry points --------------------------------------------------------------
 void setup() {
     Serial.begin(115200);
-    delay(200);
-
-    Serial.println("\n[BOOT] ESP32 Morse Station starting...");
-
-    pinMode(KEY_PIN,     INPUT_PULLUP);
+    pinMode(KEY_PIN, INPUT_PULLUP);
     pinMode(CONTROL_PIN, INPUT_PULLUP);
-    pinMode(BUZZER_PIN,  OUTPUT);
-    pinMode(TX_LED_PIN,  OUTPUT);
-    pinMode(RX_LED_PIN,  OUTPUT);
-
-    digitalWrite(BUZZER_PIN, LOW);
-    digitalWrite(TX_LED_PIN, LOW);
-    digitalWrite(RX_LED_PIN, LOW);
+    pinMode(BUZZER_PIN, OUTPUT);
+    pinMode(TX_LED_PIN, OUTPUT);
+    pinMode(RX_LED_PIN, OUTPUT);
+    stopOutputs();
+    resetInputs(millis());
 
     Wire.begin(OLED_SDA, OLED_SCL);
+    display.setBusClock(OLED_I2C_HZ);
     display.begin();
-    display.setBusClock(100000);
     display.setContrast(100);
-
-    drawBootFrame(15, "DISPLAY OK");
-    delay(250);
-
-    drawBootFrame(40, "CONNECTING WIFI");
-    initWiFiAndOTA();
-
-    drawBootFrame(70, wifiConnected ? "WIFI OK" : "WIFI OFFLINE");
-    delay(250);
-
-    drawBootFrame(90, "STARTING RADIO");
+    display.setFontMode(1);
+    display.clearBuffer();
+    display.setFont(u8g2_font_logisoso16_tf);
+    centered("LORA-CW", 0, 28, 128);
+    display.setFont(u8g2_font_5x7_tf);
+    centered("STARTING RADIO", 0, 47, 128);
+    display.sendBuffer();
+    memcpy(previousFrame, display.getBufferPtr(), FRAME_BYTES);
 
     SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
     LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
-    radioReady = LoRa.begin(LORA_FREQUENCY);
+    radioReady = LoRa.begin(LORA_FREQUENCY) != 0;
+    if (radioReady) LoRa.parsePacket();  // Arm reception immediately.
 
-    drawBootFrame(100, radioReady ? "SYSTEM READY" : "RADIO FAIL");
-    delay(400);
-
-    setStatus(radioReady ? "SYSTEM READY" : "LORA INIT FAIL");
-    serviceDisplay();
+    configureOTA();
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    WiFi.setAutoReconnect(false);  // One explicit retry state machine.
+    startWiFiAttempt(millis());
+    resetInputs(millis());
+    setStatus(radioReady ? "READY - WIFI CONNECTING" : "RADIO INIT FAILED");
+    frameAt = millis() - UI_FRAME_MS;
+    footerAt = millis();
+    Serial.println(radioReady ? "[LoRa] Ready" : "[LoRa] Initialization failed");
 }
 
-// ============================================================================
-// Main loop
-// ============================================================================
-
 void loop() {
-    maintainWiFi();
-    if (wifiConnected) {
-        ArduinoOTA.handle();
+    if (!otaActive) {
+        serviceInputs(millis());
+        serviceRadio(millis());
+        serviceOutputs(millis());
+        serviceTimers(millis());
+        maintainWiFi(millis());
     }
-
-    checkRadio();
-    checkKey();
-    checkControl();
-    updateOutputs();
-    serviceDisplay();
+    if (wifiConnected && otaStarted) ArduinoOTA.handle();
+    serviceDisplay(millis());
+    yield();
 }
