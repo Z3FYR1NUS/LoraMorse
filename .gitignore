@@ -1,6 +1,3 @@
-# Secrets -- never commit your real credentials/PSK.
-include/secrets.h
-
 # PlatformIO build outputs and caches
 .pio/
 .pioenvs/
