@@ -1,209 +1,706 @@
 # LORA-CW
 
-A standalone Morse code (CW) key/receiver for ESP32, using a LoRa radio for the RF link and an SH1106 128×64 OLED for the UI. RF packets are encrypted and authenticated with AES-128. Supports over-the-air (OTA) firmware updates over WiFi once the initial upload is done via USB.
+An encrypted, reliable Morse code (CW) transceiver framework built for ESP32 microcontrollers operating over LoRa physical-layer radios (SX127x).
+
+The system provides:
+
+* Real-time Morse key timing analysis
+* Outgoing word batching
+* AES-128-GCM authenticated encryption
+* Stop-and-wait Automatic Repeat reQuest (ARQ) delivery
+* Persistent sequence numbers using ESP32 NVS
+* Real-time UI rendered on an SH1106 128×64 I2C OLED
+* Hardware sidetone and TX/RX status indicators
+* OTA firmware updates over Wi-Fi
+
+---
 
 ## Features
 
-- Morse key input with automatic dot/dash timing and letter/word segmentation
-- **Encrypted, authenticated LoRa link** — every packet is AES-128 protected; corrupted or forged packets are rejected before they reach the decoder
-- SH1106 OLED UI showing live TX/RX cards, a timing progress bar, a scrolling received-message log, RSSI signal bars, WiFi status, and a status/footer line
-- Local sidetone buzzer feedback on key-down and on received marks
-- TX/RX LED indicators (local transmission/reception only — not delivery acknowledgment)
-- Background WiFi connection with automatic retry, and ArduinoOTA support for wireless firmware updates
-- Partial-display updates (dirty-tile diffing) to keep the I2C bus and UI responsive without blocking key/radio timing
+### Morse Code Parsing Engine
 
-## Hardware
+Real-time Morse timing discrimination:
 
-| Component | Notes |
-|---|---|
-| ESP32 dev board | Any standard ESP32 devkit |
-| SX1278 LoRa module | 433 MHz variant expected (`LORA_FREQUENCY = 433000000L`) |
-| SH1106 128×64 OLED | I2C, hardware I2C driver (`U8G2_SH1106_128X64_NONAME_F_HW_I2C`) |
-| Morse key (paddle/switch) | Wired to `KEY_PIN`, active-low |
-| Control button | Wired to `CONTROL_PIN`, active-low |
-| Buzzer | Active buzzer expected; see note below for passive piezos |
-| TX / RX LEDs | Simple indicator LEDs |
+* `< 220 ms` → dot (`.`)
+* `>= 220 ms` → dash (`-`)
+* `600 ms` character completion timeout
+* Binary lookup tree for Morse character decoding
 
-### Pinout (default)
+### Batching & Outbox Queue
 
-| Signal | GPIO |
-|---|---|
-| LoRa SCK | 18 |
-| LoRa MISO | 19 |
-| LoRa MOSI | 23 |
-| LoRa CS (NSS) | 16 |
-| LoRa RST | 26 |
-| LoRa DIO0 | 25 |
-| OLED SDA | 21 |
-| OLED SCL | 22 |
-| Buzzer | 33 |
-| TX LED | 32 |
-| RX LED | 13 |
-| Key input | 27 |
-| Control button | 14 |
+Characters are buffered into outgoing payloads.
 
-All pins are defined as `constexpr` near the top of the sketch and can be changed there if your wiring differs.
+A packet is transmitted automatically when:
 
-## Libraries
+* A space is inserted
+* The payload reaches the 16-byte maximum
+* The outbox has been idle for 1500 ms
 
-- [LoRa by Sandeep Mistry](https://github.com/sandeepmistry/arduino-LoRa) — `^0.8.0`
-- [U8g2 by olikraus](https://github.com/olikraus/u8g2) — `^2.35.19`
-- ESP32 Arduino core's built-in `WiFi` and `ArduinoOTA` libraries
-- ESP32 Arduino core's bundled **mbedtls** (`mbedtls/aes.h`) for AES-128, and `esp_random()` (hardware TRNG) — no extra dependency needed
+### Authenticated Encryption
 
-These are already declared in `platformio.ini` under `lib_deps`.
+All data frames use:
 
-## Building and flashing (PlatformIO)
+* AES-128-GCM
+* 128-bit encryption key
+* 12-byte random nonces
+* 16-byte authentication tags
+* `esp_random()` for nonce generation
+* ESP32 `mbedtls` cryptographic implementation
 
-This project ships with two environments:
+### ARQ Reliability Layer
 
-- **`env:esp32dev`** — standard USB/serial upload, used for the first flash
-- **`env:ota`** — wireless upload over WiFi via `espota`, extends `env:esp32dev`
+Reliable delivery is implemented using stop-and-wait ARQ.
 
-### First flash (USB)
+Features:
 
-Before building, fill in your WiFi/OTA credentials and generate an encryption key.
+* 32-bit sequence numbers
+* Sequence numbers persisted across reboots using ESP32 NVS
+* 400 ms ACK timeout
+* Up to 3 retransmissions per frame
+* Duplicate frame suppression
+* Explicit ACK frames
 
-**1. Generate a key on your own machine** (never paste real keys into chat, tickets, or anywhere else they could leak):
+### Hardware Sidetone & Visuals
 
-```sh
-openssl rand -hex 16
+The device provides real-time feedback through:
+
+* PWM/GPIO buzzer sidetone
+* Dedicated TX LED
+* Dedicated RX LED
+* SH1106 128×64 OLED
+
+The OLED displays telemetry including:
+
+* RSSI
+* Outbox buffer state
+* Sequence counters
+* Message history
+* Transmission/reception state
+
+### OTA Maintenance
+
+Wi-Fi station connectivity supports background firmware updates using ArduinoOTA.
+
+---
+
+# Hardware Pinout
+
+| Module / Component  | ESP32 GPIO | Description / Protocol        |
+| ------------------- | ---------: | ----------------------------- |
+| **LoRa SCK**        |    GPIO 18 | SPI Clock                     |
+| **LoRa MISO**       |    GPIO 19 | SPI Master In Slave Out       |
+| **LoRa MOSI**       |    GPIO 23 | SPI Master Out Slave In       |
+| **LoRa CS**         |    GPIO 16 | Chip Select                   |
+| **LoRa RST**        |    GPIO 26 | Hardware Reset                |
+| **LoRa DIO0**       |    GPIO 25 | TX/RX Interrupt Input         |
+| **OLED SDA**        |    GPIO 21 | I2C Data (SH1106)             |
+| **OLED SCL**        |    GPIO 22 | I2C Clock (SH1106, 400 kHz)   |
+| **Morse Key Input** |    GPIO 27 | Active LOW (`INPUT_PULLUP`)   |
+| **Control Button**  |    GPIO 14 | Active LOW (`INPUT_PULLUP`)   |
+| **Buzzer Output**   |    GPIO 33 | Active HIGH (Sidetone / Beep) |
+| **TX LED**          |    GPIO 32 | Active HIGH                   |
+| **RX LED**          |    GPIO 13 | Active HIGH                   |
+
+---
+
+# Protocol Specification
+
+Each frame transmitted over the LoRa physical link is:
+
+1. Framed
+2. Encrypted
+3. Authenticated
+4. Transmitted using the configured LoRa parameters
+
+The maximum physical frame size is **56 bytes**.
+
+## Frame Layout
+
+```text
++-------------------+--------------------+-------------------+
+|    Header (24 B)  | Ciphertext (0-16B) |   Auth Tag (16 B) |
++-------------------+--------------------+-------------------+
 ```
 
-This prints a 32-character hex string, e.g. `9f2c...` (illustrative only — generate your own).
+### Frame Size
 
-**2. Paste it into `main.cpp`:**
+| Component          |         Size |
+| ------------------ | -----------: |
+| Header             |     24 bytes |
+| Ciphertext         |   0–16 bytes |
+| Authentication Tag |     16 bytes |
+| **Maximum**        | **56 bytes** |
+
+---
+
+## Header Structure
+
+| Offset      | Field               | Type          | Description                                   |
+| ----------- | ------------------- | ------------- | --------------------------------------------- |
+| `0x00`      | Magic Byte          | `uint8_t`     | Constant `0xC7` protocol identifier           |
+| `0x01`      | Protocol Version    | `uint8_t`     | Constant `0x01`                               |
+| `0x02`      | Packet Type         | `uint8_t`     | `1` = Data Frame, `2` = ACK                   |
+| `0x03–0x04` | Source ID           | `uint16_t`    | Big-endian source node identifier             |
+| `0x05–0x06` | Destination ID      | `uint16_t`    | Big-endian target node identifier             |
+| `0x07–0x0A` | Sequence ID         | `uint32_t`    | Big-endian monotonic frame sequence number    |
+| `0x0B–0x16` | Cryptographic Nonce | `uint8_t[12]` | Random nonce generated using `esp_random()`   |
+| `0x17`      | Payload Length      | `uint8_t`     | Length `N` of plaintext payload, `0 ≤ N ≤ 16` |
+
+---
+
+# Packet Types
+
+| Packet Type | Value | Purpose                                           |
+| ----------- | ----: | ------------------------------------------------- |
+| Data Frame  |   `1` | Encrypted application payload                     |
+| ACK         |   `2` | Acknowledges successful reception of a data frame |
+
+---
+
+# Morse Engine
+
+## Timing Rules
+
+The Morse engine determines whether a key press represents a dot or dash based on its duration.
+
+| Key Duration | Morse Symbol |
+| -----------: | ------------ |
+|   `< 220 ms` | Dot (`.`)    |
+|  `>= 220 ms` | Dash (`-`)   |
+
+For example:
+
+```text
+Short press  → .
+Long press   → -
+```
+
+## Letter Separation
+
+When no key press occurs for **600 ms**, the current Morse symbol sequence is considered complete.
+
+The sequence is then decoded using the Morse binary lookup tree.
+
+Example:
+
+```text
+.-
+
+600 ms pause
+
+→ A
+```
+
+---
+
+# Outbox & Automatic Transmission
+
+The transmitter buffers decoded characters in an outgoing queue.
+
+A packet is automatically generated and transmitted when one of the following conditions occurs:
+
+### 1. Space Insertion
+
+A space indicates a word boundary and triggers transmission.
+
+### 2. Payload Saturation
+
+The payload reaches the maximum size:
+
+```text
+16 bytes
+```
+
+### 3. Idle Timeout
+
+If the outbox contains data and remains idle for:
+
+```text
+1500 ms
+```
+
+the queued characters are automatically transmitted.
+
+---
+
+# Control Button
+
+The control button is connected to GPIO 14 and uses:
+
+```text
+INPUT_PULLUP
+```
+
+The button is active LOW.
+
+## Short Tap
+
+A short tap:
+
+1. Immediately flushes the current outbox.
+2. Creates a data frame.
+3. Encrypts the payload.
+4. Transmits the frame over LoRa.
+
+## Long Press
+
+A long press is defined as:
+
+```text
+>= 500 ms
+```
+
+A long press:
+
+1. Appends an explicit space character (`' '`) to the outbox.
+2. Flushes the outbox if required.
+
+---
+
+# Encryption
+
+LORA-CW uses authenticated encryption based on **AES-128-GCM**.
+
+## Cryptographic Parameters
+
+| Parameter                 | Value          |
+| ------------------------- | -------------- |
+| Algorithm                 | AES-128-GCM    |
+| Key Size                  | 128 bits       |
+| Nonce Size                | 12 bytes       |
+| Authentication Tag        | 16 bytes       |
+| Maximum Plaintext Payload | 16 bytes       |
+| Nonce Source              | `esp_random()` |
+
+The authentication tag ensures that modified or forged encrypted frames are rejected.
+
+---
+
+# Reliability & ARQ
+
+LORA-CW implements a stop-and-wait ARQ protocol.
+
+## Transmission Flow
+
+```text
+Sender                                  Receiver
+  │                                        │
+  │──── Encrypted DATA(seq=N) ───────────>│
+  │                                        │
+  │<──────────── ACK(seq=N) ──────────────│
+  │                                        │
+  │       Transmission complete            │
+```
+
+If the ACK is not received within the configured timeout:
+
+```text
+400 ms
+```
+
+the sender retransmits the frame.
+
+## Retransmission Policy
+
+Each frame may be retransmitted up to:
+
+```text
+3 times
+```
+
+If all attempts fail, the frame is considered undelivered.
+
+## Duplicate Suppression
+
+The receiver tracks received sequence numbers.
+
+If a duplicate data frame is received:
+
+1. The payload is not delivered twice.
+2. The receiver responds appropriately with an ACK.
+3. The duplicate is discarded.
+
+---
+
+# Sequence Numbers
+
+Each data frame contains a 32-bit sequence number:
+
+```text
+uint32_t
+```
+
+Sequence numbers are monotonic and persisted using ESP32 NVS.
+
+This allows sequence state to survive device reboots.
+
+Example:
+
+```text
+Boot #1:
+  TX seq = 100
+
+Reboot
+
+Boot #2:
+  TX seq = 101
+```
+
+---
+
+# OLED Interface
+
+The device uses a:
+
+```text
+SH1106
+128×64
+I2C
+400 kHz
+```
+
+OLED display.
+
+The UI provides real-time telemetry including:
+
+* Current transmission state
+* Current reception state
+* RSSI
+* Outbox contents
+* Sequence counters
+* Message history
+* ARQ status
+
+---
+
+# Wi-Fi & OTA
+
+LORA-CW supports optional Wi-Fi connectivity for OTA firmware updates.
+
+OTA functionality is controlled by:
 
 ```cpp
-const char* WIFI_SSID = "your-ssid";
-const char* WIFI_PASS = "your-password";
-const char* OTA_HOSTNAME = "lora-cw";
-const char* OTA_PASSWORD = "";   // optional
-
-// Paste your own openssl rand -hex 16 output here — do not reuse this example:
-constexpr char AES_KEY_HEX[] = "9f2c8a3e1d4b6f705c9a2e8d1b4f6073";
+constexpr bool ENABLE_OTA = true;
 ```
 
-The firmware decodes `AES_KEY_HEX` into the raw AES key once at boot (`loadAesKeyFromHex()` in `setup()`). If the string is missing, the wrong length, or contains a non-hex character, the device halts and prints an error over serial instead of silently running with a broken key.
+When enabled, the ESP32 connects to the configured Wi-Fi network and exposes ArduinoOTA functionality.
 
-> Don't commit your real `AES_KEY_HEX` to a public repository. Consider moving it into a local, gitignored header, or loading it from NVS, once you're past initial bring-up.
+---
 
-**3. Build and upload over USB:**
+# User Configuration
 
-```sh
-pio run -e esp32dev -t upload
-pio device monitor -b 115200
+All operational parameters are defined in the firmware source under the **USER CONFIGURATION** section.
+
+```cpp
+// Device Addressing
+constexpr uint16_t DEVICE_ID = 0x0002;
+constexpr uint16_t PEER_DEVICE_ID = 0x0001;
+
+// Cryptographic Key
+// 32 hexadecimal characters = 128-bit AES key
+constexpr char AES_KEY_HEX[] =
+    "00112233445566778899AABBCCDDEEFF";
+
+// LoRa RF Parameters
+constexpr long LORA_FREQUENCY = 433000000L;
+constexpr long LORA_BANDWIDTH = 125000L;
+constexpr int LORA_SPREADING_FACTOR = 7;
+constexpr int LORA_CODING_RATE = 5;
+constexpr uint8_t LORA_SYNC_WORD = 0x12;
+
+// Wi-Fi & OTA Updates
+const char* WIFI_SSID = "YourSSID";
+const char* WIFI_PASS = "YourPassword";
+constexpr bool ENABLE_OTA = true;
 ```
 
-> The board must use an **OTA-capable partition scheme** (e.g. "Minimal SPIFFS" or "Default with OTA") so `ArduinoOTA` has two app partitions to swap between.
+## Device Addressing
 
-### Subsequent updates (OTA / WiFi)
+Each device must have a unique node ID.
 
-Once the device has joined your WiFi network (check the serial monitor or the OLED footer for its IP address), edit `platformio.ini` and set the device's IP as the upload port:
+Example:
 
-```ini
-[env:ota]
-extends = env:esp32dev
-upload_protocol = espota
-upload_port = 192.168.1.42   ; replace with your device's IP
-upload_flags =
-    --progress
+```text
+Device A:
+  DEVICE_ID      = 0x0001
+  PEER_DEVICE_ID = 0x0002
+
+Device B:
+  DEVICE_ID      = 0x0002
+  PEER_DEVICE_ID = 0x0001
 ```
 
-Then upload wirelessly:
+## Cryptographic Key
 
-```sh
-pio run -e ota -t upload
+Both devices must use the same AES-128 key.
+
+The configured key contains:
+
+```text
+32 hexadecimal characters
 ```
 
-While an OTA update is in progress, the device suspends normal key/radio operation, silences all outputs, and shows a progress screen on the OLED. **Keep the device powered during the update.**
+which represents:
 
-## Controls
-
-| Action | Result |
-|---|---|
-| Tap **KEY**, release under 250 ms | Sends a dot |
-| Tap **KEY**, hold 250 ms or more | Sends a dash |
-| Pause 850 ms after the last mark | Ends the current letter (auto-sent) |
-| Tap **CONTROL** (release before 700 ms) | Clears local input/display buffers |
-| Hold **CONTROL** for 700 ms | Sends a word space |
-
-Clearing the buffers only affects local/pending state — any letter already transmitted over LoRa cannot be recalled.
-
-## Display layout
-
-- **Header** — title, LoRa status ("433" or "RF!"), RSSI bars + value (or "RX --" if nothing received yet), WiFi status bars/X
-- **TX card** — current outgoing dot/dash pattern, decoded letter preview, lit while keying
-- **RX card** — current incoming dot/dash pattern, last decoded letter, lit briefly on reception
-- **Progress bar** — fills to show elapsed time toward the current threshold (dot/dash split, control hold, or letter-pause timeout)
-- **Log** — last two lines (up to 48 characters) of the received message
-- **Footer** — rotates between radio/WiFi status, transient status messages (including `BAD/UNAUTH PACKET` or `BAD PACKET SIZE` if a corrupted/foreign packet is rejected), TX queue size, and the device's IP address
-
-## Security / packet encryption
-
-Every over-the-air packet carries a single logical Morse token (`.`, `-`, `/`, or `' '`), but the on-air bytes are encrypted and authenticated:
-
-```
-[8-byte random nonce][1-byte ciphertext][1-byte authentication tag]   (10 bytes total)
+```text
+128 bits
 ```
 
-How it works:
+**Do not commit production cryptographic keys or Wi-Fi credentials to a public repository.**
 
-- A fresh, random 8-byte nonce (from the ESP32's hardware TRNG, `esp_random()`) is generated for **every** packet.
-- That nonce is encrypted once with AES-128-ECB under the pre-shared key, producing 16 keystream bytes. This uses AES as a keyed PRF rather than a traditional stream-cipher mode — since the nonce never repeats, no keystream byte is ever reused, so there's no counter/IV state to keep in sync between TX and RX.
-- **Ciphertext** = `token XOR keystream[0]`
-- **Tag** = `keystream[1]` — the receiver independently recomputes the keystream from the received nonce and its own copy of the key; if the received tag doesn't match, the packet is dropped as corrupted or forged, without ever touching the decoder.
+---
 
-### Key setup
+# LoRa Configuration
 
-The raw 16-byte AES key is never typed in by hand. Instead:
+Default configuration:
 
-1. Generate 32 hex characters with `openssl rand -hex 16`.
-2. Paste that string into `AES_KEY_HEX` in `main.cpp`.
-3. At boot, `loadAesKeyFromHex()` decodes it into the working `AES_KEY` array and halts with a serial error if the string is the wrong length or contains invalid characters.
-4. Paste the **exact same** `AES_KEY_HEX` value into both the transmitting and receiving device's firmware — the link only works if both sides derive the same keystream.
+| Parameter        |     Value |
+| ---------------- | --------: |
+| Frequency        | `433 MHz` |
+| Bandwidth        | `125 kHz` |
+| Spreading Factor |     `SF7` |
+| Coding Rate      |     `4/5` |
+| Sync Word        |    `0x12` |
 
-Implications:
+Configuration:
 
-- **Not compatible with an unmodified/original peer.** Both ends of the link must run this firmware version and share the identical key.
-- **Packet size increased** from 1 byte to 10 bytes, which proportionally increases per-packet LoRa airtime. This is still trivial relative to a human keying speed.
-- **LoRa's CRC remains off** (matching the original defaults) — the authentication tag independently catches corruption and forgery, so a separate CRC isn't needed for this purpose.
-- This provides confidentiality and per-packet authenticity, but **not replay protection** — a captured packet re-sent later would still decrypt to a valid single mark. Given that a lone dot/dash carries no exploitable state on its own, this is an accepted trade-off; a sequence number could be added if stronger guarantees against replay/injection are needed.
-- **Never paste a real key into chat tools, tickets, commit messages, or anywhere else outside the device's own firmware** — treat any key that has been typed somewhere else as compromised and regenerate it.
+```cpp
+constexpr long LORA_FREQUENCY = 433000000L;
+constexpr long LORA_BANDWIDTH = 125000L;
+constexpr int LORA_SPREADING_FACTOR = 7;
+constexpr int LORA_CODING_RATE = 5;
+constexpr uint8_t LORA_SYNC_WORD = 0x12;
+```
 
-## Protocol notes
+The selected frequency and RF configuration must comply with the applicable local radio regulations.
 
-- Each Morse element is sent as one AES-protected packet (see above) rather than a bare byte.
-- TX/RX LED indicators reflect **local** transmit/receive activity only; there is no delivery acknowledgment from the remote peer.
+---
 
-## Configuration reference
+# Required Dependencies
 
-Key tunables are defined near the top of the sketch:
+The project relies on the ESP32 Arduino framework and the following libraries.
 
-| Constant | Purpose |
-|---|---|
-| `AES_KEY_HEX` | 32-character hex string (16 bytes) decoded into the AES key at boot; must match on both peers |
-| `LORA_FREQUENCY` | LoRa carrier frequency (Hz) |
-| `OLED_I2C_HZ` | OLED I2C bus speed; lower to `100000` if your module/wiring needs it |
-| `KEY_SIDETONE` | Set `false` to disable the local sidetone (receive-only audio) |
-| `DOT_DASH_SPLIT_MS` | Threshold between a dot and a dash |
-| `CHARACTER_PAUSE_MS` | Gap that ends a letter |
-| `CONTROL_HOLD_MS` | Hold duration on CONTROL to send a word space |
-| `TX_TIMEOUT_MS` | Increase if using very slow LoRa settings |
-| `RX_STALE_MS` | Time before an incomplete received letter is discarded |
-| `WIFI_CONNECT_TIMEOUT_MS` / `WIFI_RETRY_INTERVAL_MS` | WiFi connection attempt/retry timing |
+| Dependency                 | Purpose                  |
+| -------------------------- | ------------------------ |
+| **U8g2** by Oliver Kraus   | OLED display driver      |
+| **LoRa** by Sandeep Mistry | SX127x LoRa radio driver |
+| **Preferences**            | ESP32 NVS storage        |
+| **ArduinoOTA**             | OTA firmware updates     |
+| **WiFi**                   | Wi-Fi connectivity       |
+| **mbedTLS**                | AES-GCM cryptography     |
 
-## Hardware notes
+`Preferences`, `ArduinoOTA`, `WiFi`, and `mbedTLS` are provided by the ESP32 Arduino environment and do not normally require separate installation.
 
-- The buzzer is assumed to be **active** (driven simply HIGH/LOW). If you use a **passive piezo**, you'll need to drive `BUZZER_PIN` with PWM/tone output instead of a digital HIGH/LOW.
-- Radio TX and WiFi connection waits are cooperative (non-blocking in the main loop), but LoRa SPI transfers, radio initialization, AES operations, and the actual OTA flash write are synchronous and will briefly block.
+---
 
-## Troubleshooting
+# Hardware Requirements
 
-- **Device halts at boot printing `[FATAL] AES_KEY_HEX must be exactly 32 hex characters`** — `AES_KEY_HEX` was left as the placeholder, is the wrong length, or contains a typo. Generate a fresh key with `openssl rand -hex 16` and paste the full 32-character string in.
-- **"RADIO OFFLINE" / "RF!" in header** — check LoRa module wiring (SPI pins, CS/RST/DIO0) and frequency match with the peer.
-- **"BAD/UNAUTH PACKET" in footer** — the peer's key doesn't match yours, or the packet was corrupted/foreign. Confirm both devices run this firmware and share the identical `AES_KEY_HEX`.
-- **"BAD PACKET SIZE" in footer** — something on the same frequency sent a packet that isn't 10 bytes (e.g. an unmodified/original peer, or unrelated LoRa traffic).
-- **OLED shows nothing** — verify I2C wiring and try lowering `OLED_I2C_HZ` to `100000`.
-- **WiFi never connects** — Morse/LoRa functionality still works without WiFi; OTA simply won't be available until the device joins the network. Check credentials and signal strength.
-- **OTA upload fails** — confirm the board's partition scheme supports OTA, that the device is on the same network, and that `upload_port` in `platformio.ini` matches the device's current IP.
+Each transceiver requires:
+
+* ESP32 development board
+* SX127x LoRa radio module
+* SH1106 128×64 I2C OLED
+* Morse key
+* Control button
+* Buzzer
+* TX LED
+* RX LED
+
+The same firmware architecture can be used on both nodes by changing:
+
+```cpp
+DEVICE_ID
+PEER_DEVICE_ID
+```
+
+and other node-specific configuration values.
+
+---
+
+# Software Setup
+
+## Arduino IDE
+
+1. Install the ESP32 board package.
+
+2. Select:
+
+   ```text
+   ESP32 Dev Module
+   ```
+
+3. Install the required libraries.
+
+4. Configure the firmware under the `USER CONFIGURATION` section.
+
+5. Verify the GPIO assignments.
+
+6. Connect the ESP32 through USB.
+
+7. Compile the firmware.
+
+8. Upload the firmware.
+
+## PlatformIO
+
+Configure the project for an ESP32 development board using the Arduino framework.
+
+The project should provide the required dependencies through `platformio.ini`.
+
+---
+
+# Partition Scheme
+
+The firmware requires NVS storage for persistent sequence numbers.
+
+A suitable partition configuration is:
+
+```text
+Default 4MB with spiffs
+```
+
+or another partition profile that provides sufficient NVS storage.
+
+---
+
+# OTA Updates
+
+Once the initial firmware has been uploaded over USB, subsequent firmware updates can be performed through ArduinoOTA when:
+
+```cpp
+constexpr bool ENABLE_OTA = true;
+```
+
+is enabled.
+
+The ESP32 must be connected to the configured Wi-Fi network before OTA updates can be performed.
+
+---
+
+# Initial Deployment Checklist
+
+Before flashing the firmware, verify:
+
+* [ ] ESP32 board is correctly selected.
+* [ ] LoRa module wiring matches the GPIO map.
+* [ ] OLED wiring matches SDA/SCL configuration.
+* [ ] Morse key is connected to GPIO 27.
+* [ ] Control button is connected to GPIO 14.
+* [ ] Buzzer is connected to GPIO 33.
+* [ ] TX LED is connected to GPIO 32.
+* [ ] RX LED is connected to GPIO 13.
+* [ ] `DEVICE_ID` is unique.
+* [ ] `PEER_DEVICE_ID` points to the intended remote device.
+* [ ] Both devices use the same AES-128 key.
+* [ ] LoRa frequency is appropriate for the deployment region.
+* [ ] LoRa parameters match on both devices.
+* [ ] Wi-Fi credentials are configured if OTA is enabled.
+* [ ] NVS-capable partition scheme is selected.
+* [ ] Production secrets are not committed to version control.
+
+---
+
+# Communication Example
+
+Assume two devices:
+
+```text
+Node A
+DEVICE_ID = 0x0001
+
+Node B
+DEVICE_ID = 0x0002
+```
+
+Node A enters:
+
+```text
+HELLO
+```
+
+The Morse engine decodes each character and places the resulting text into the outbox.
+
+When the transmission conditions are met, the payload is encrypted and transmitted:
+
+```text
+Node A
+  │
+  │ DATA
+  │ seq=42
+  │ encrypted "HELLO"
+  │
+  ▼
+Node B
+  │
+  │ decrypt
+  │ authenticate
+  │ validate sequence
+  │ decode payload
+  │
+  ▼
+  "HELLO"
+  │
+  │ ACK seq=42
+  ▼
+Node A
+```
+
+If the ACK is lost:
+
+```text
+Node A                         Node B
+  │                              │
+  │──── DATA seq=42 ───────────>│
+  │                              │
+  │<──────── ACK ────────X       │
+  │                              │
+  │     ACK timeout              │
+  │                              │
+  │──── DATA seq=42 ───────────>│
+  │                              │
+  │        duplicate             │
+  │        suppressed            │
+  │                              │
+  │<──────── ACK seq=42 ─────────│
+```
+
+The receiver therefore does not deliver the same application payload twice.
+
+---
+
+# Protocol Constants
+
+For quick reference:
+
+| Parameter               |      Value |
+| ----------------------- | ---------: |
+| Protocol Magic          |     `0xC7` |
+| Protocol Version        |     `0x01` |
+| Data Packet Type        |        `1` |
+| ACK Packet Type         |        `2` |
+| Header Size             | `24 bytes` |
+| Maximum Payload         | `16 bytes` |
+| Authentication Tag      | `16 bytes` |
+| Maximum Frame           | `56 bytes` |
+| Nonce Size              | `12 bytes` |
+| AES Key Size            | `128 bits` |
+| Dot/Dash Threshold      |   `220 ms` |
+| Character Timeout       |   `600 ms` |
+| Outbox Idle Timeout     |  `1500 ms` |
+| Long-Press Threshold    |   `500 ms` |
+| ACK Timeout             |   `400 ms` |
+| Maximum Retransmissions |        `3` |
+
+---
+
+# License
+
+Add the project's license information here.
+
+For example:
+
+```text
+MIT License
+```
+
+if the project is intended to be distributed under the MIT License.
