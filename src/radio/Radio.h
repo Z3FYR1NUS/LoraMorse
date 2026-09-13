@@ -1,7 +1,7 @@
 #pragma once
 
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
 
 class Radio {
 public:
@@ -19,9 +19,16 @@ public:
     int lastRssi() const;
     float lastSnr() const;
 
-    bool ready() const { return ready_; }
+    bool ready() const {
+        return ready_;
+    }
 
 private:
+    static Radio* instance_;
+    static void onTxDoneStatic();
+
+    void onTxDone();
+
     bool ready_ = false;
     bool transmitting_ = false;
 };
