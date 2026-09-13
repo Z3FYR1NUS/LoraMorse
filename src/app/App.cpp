@@ -165,7 +165,8 @@ bool App::queueToken(char token, char decoded, bool reserveDelimiter) {
     // A mark always leaves room for its terminating slash.
     const uint8_t limit = app_cfg::TX_QUEUE_SIZE - (reserveDelimiter ? 1 : 0);
     if (txCount_ >= limit) { setStatus("TX QUEUE FULL"); return false; }
-    txQueue_[txTail_] = {token, decoded};
+    txQueue_[txTail_].token = token;
+    txQueue_[txTail_].decoded = decoded;
     txTail_ = uint8_t((txTail_ + 1) % app_cfg::TX_QUEUE_SIZE);
     ++txCount_;
     display_.markDirty();
