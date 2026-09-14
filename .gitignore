@@ -4,7 +4,6 @@
 .piolibdeps/
 .clangd/
 
-# VS Code directory (ignore completely to avoid local state tracking)
 .vscode/
 
 # C/C++ Compilation & Linker artifacts
@@ -15,7 +14,6 @@
 *.out
 *.map
 
-# OS / Environment noise (Windows / macOS)
 Thumbs.db
 Desktop.ini
 [Dd]esktop.ini
