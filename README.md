@@ -1,162 +1,237 @@
-# LORA-CW
+# LORA-CWA Dual-Purpose ESP32 Firmware
 
-Encrypted, ARQ-reliable Morse (CW) transceiver for ESP32 + SX127x LoRa radios. Live telemetry on an SH1106 OLED, hardware sidetone, WiFi OTA updates.
+A **Morse-code keyer** that transmits dot/dash tokens over LoRa, paired with a **128×64 SH1106 OLED UI** and optional **WiFi/OTA** for wireless firmware updates. Every over-the-air token is authenticated with AES-128 using a fresh hardware-TRNG nonce per packet.
+
+---
 
 ## Features
 
-- Real-time Morse timing discrimination (dot / dash / character gap)
-- Outgoing character batching into fixed-size payloads
-- AES-128-GCM authenticated encryption (random 12-byte nonce, 16-byte tag)
-- Stop-and-wait ARQ — sequence numbers, ACKs, retransmission, duplicate suppression
-- Sequence numbers persisted across reboots (ESP32 NVS)
-- Live telemetry on a 128×64 SH1106 OLED — RSSI, outbox state, sequence counters, message log
-- Buzzer sidetone, dedicated TX/RX LEDs
-- WiFi OTA firmware updates (ArduinoOTA)
+- **Live Morse Keying:** Tactile push-button input with automatic dot/dash discrimination via hold duration.
+- **LoRa Transport @ 433 MHz:** Configurable RF parameters using `sandeepmistry/LoRa`.
+- **Per-Packet AES-128 Authentication:** Random 8-byte nonce per packet with a keystream-derived tag to reject forged or corrupted frames.
+- **SSD1306/SH1106 OLED UI:** Displays headers, live keying preview, animated RX "listening" bars, sliding message log, and a status footer.
+- **Dirty-Tile Display Flushing:** Pushes only changed 8-byte tiles over I²C in small batches between RF/key servicing.
+- **Non-Blocking State Machines:** Cooperative scheduling in `loop()` for TX queue, RX FIFO drain, beep queue, WiFi retry, and UI animations.
+- **WiFi + ArduinoOTA:** Opt-in remote updates; safely suspends radio, queues a boundary token on failure, and draws a full-screen progress UI.
+
+---
 
 ## Hardware
 
-| Component | GPIO | Notes |
-|---|---:|---|
-| LoRa SCK | 18 | SPI clock |
-| LoRa MISO | 19 | SPI MISO |
-| LoRa MOSI | 23 | SPI MOSI |
-| LoRa CS | 16 | Chip select |
-| LoRa RST | 26 | Reset |
-| LoRa DIO0 | 25 | TX/RX IRQ |
-| OLED SDA | 21 | I2C data (SH1106, 400 kHz) |
-| OLED SCL | 22 | I2C clock |
-| Morse key | 27 | `INPUT_PULLUP`, active low |
-| Control button | 14 | `INPUT_PULLUP`, active low |
-| Buzzer | 33 | Active high |
-| TX LED | 32 | Active high |
-| RX LED | 13 | Active high |
+| Signal | GPIO | Notes |
+|---|---|---|
+| LoRa SCK / MISO / MOSI | 18 / 19 / 23 | VSPI |
+| LoRa CS / RST / DIO0 | 16 / 26 / 25 | Standard SPI control |
+| OLED SDA / SCL | 21 / 22 | I²C, 400 kHz |
+| Buzzer | 33 | Sidetone + RX beeps |
+| TX LED / RX LED | 32 / 13 | Active-high |
+| KEY (straight key) | 27 | `INPUT_PULLUP`, active-low |
+| CONTROL (function) | 14 | `INPUT_PULLUP`, active-low |
 
-## Build & Flash (PlatformIO)
+**Display:** U8g2 `SH1106 128×64` (Full framebuffer, HW I²C, noname).
 
-```ini
-[env]
-platform = espressif32
-board = esp32dev
-framework = arduino
-monitor_speed = 115200
-lib_deps =
-    sandeepmistry/LoRa @ ^0.8.0
-    olikraus/U8g2 @ ^2.35.19
-
-[env:esp32dev]
-upload_speed = 921600
-build_flags = -D CORE_DEBUG_LEVEL=0
-
-[env:ota]
-extends = env:esp32dev
-upload_protocol = espota
-upload_port =
-upload_flags = --progress --auth=
-```
-
-```sh
-pio run -e esp32dev -t upload   # initial flash over USB
-pio run -e ota -t upload        # later updates over WiFi (needs ENABLE_OTA = true)
-```
-
-Requires an NVS-capable partition scheme (e.g. "Default 4MB with spiffs") for the persistent sequence counter.
+---
 
 ## Configuration
 
-Edit the `USER CONFIGURATION` block per node before flashing:
+All core configurations reside at the top of `src/main.cpp`.
+
+### Required — AES Key
 
 ```cpp
-// Device addressing — unique per node, mirrored on the peer
-constexpr uint16_t DEVICE_ID = 0x0002;
-constexpr uint16_t PEER_DEVICE_ID = 0x0001;
-
-// AES-128 key — 32 hex chars, identical on both nodes
-constexpr char AES_KEY_HEX[] = "00112233445566778899AABBCCDDEEFF";
-
-// LoRa RF parameters — must match on both nodes
-constexpr long LORA_FREQUENCY = 433000000L;   // check local regulations
-constexpr long LORA_BANDWIDTH = 125000L;
-constexpr int  LORA_SPREADING_FACTOR = 7;
-constexpr int  LORA_CODING_RATE = 5;
-constexpr uint8_t LORA_SYNC_WORD = 0x12;
-
-// WiFi / OTA
-const char* WIFI_SSID = "YourSSID";
-const char* WIFI_PASS = "YourPassword";
-constexpr bool ENABLE_OTA = true;
+constexpr char AES_KEY_HEX[] = "";   // 32 hex chars = 16 bytes
 ```
 
-Two-node example:
+Generate a valid key using OpenSSL:
 
-| | `DEVICE_ID` | `PEER_DEVICE_ID` |
-|---|---:|---:|
-| Node A | `0x0001` | `0x0002` |
-| Node B | `0x0002` | `0x0001` |
+```bash
+openssl rand -hex 16
+```
 
-> Don't commit production keys or WiFi credentials.
+> **Note:** The firmware halts in `setup()` if `AES_KEY_HEX` is not exactly 32 hex characters. Both ends of the radio link must use identical keys.
 
-## Morse Engine
+### Optional — WiFi / OTA
 
-| Threshold | Value |
-|---|---:|
-| Dot / dash split | `< 220 ms` / `>= 220 ms` |
-| Character timeout | `600 ms` |
-| Outbox idle flush | `1500 ms` |
-| Max payload before flush | `16 bytes` |
-| Control-button long press | `>= 500 ms` |
+```cpp
+const char* WIFI_SSID    = "";
+const char* WIFI_PASS    = "";
+const char* OTA_HOSTNAME = "";
+const char* OTA_PASSWORD = "";   // Leave empty to skip OTA authentication
+```
 
-Short tap on the control button flushes the outbox and transmits immediately. Long press appends a word space, then flushes.
+If `WIFI_SSID` is left empty, the WiFi radio is set to `WIFI_OFF` and Morse/LoRa keying operates standalone.
+
+### Radio Parameters
+
+```cpp
+constexpr long LORA_FREQUENCY = 433000000L;   // 433 MHz
+```
+
+The header and splash screen automatically derive the `433`, `868`, or `915` label from this constant.
+
+---
+
+## Build & Flash (PlatformIO)
+
+### Dependencies
+
+```ini
+sandeepmistry/LoRa @ ^0.8.0
+olikraus/U8g2      @ ^2.35.19
+```
+
+* Platform: `espressif32`
+* Board: `esp32dev`
+* Framework: `arduino`
+
+### Standard USB Upload
+
+```bash
+pio run -e esp32dev -t upload
+pio device monitor -b 115200
+```
+
+Configuration defaults: `upload_speed = 921600`, `CORE_DEBUG_LEVEL = 0`.
+
+### OTA Upload
+
+Configure `upload_port` in `platformio.ini` with the target IP, then execute:
+
+```bash
+pio run -e ota -t upload
+```
+
+The `--auth=<password>` must match `OTA_PASSWORD`. Progress renders on the OLED during transfer; keying and RF tasks are paused for the duration.
+
+---
+
+## Controls
+
+| Input | Action |
+|---|---|
+| `KEY` tap (< 250 ms) | Send dot (`.`) |
+| `KEY` hold (≥ 250 ms) | Send dash (`-`) |
+| `KEY` idle ≥ 850 ms | Finalize letter and queue `/` boundary |
+| `CONTROL` tap | Clear buffers (locally + notify peer) |
+| `CONTROL` hold ≥ 700 ms | Queue a space token (` `) |
+
+---
 
 ## Protocol
 
-Frame layout: `header (24B) + ciphertext (0–16B) + auth tag (16B)`, max **56 bytes**.
+Every LoRa packet is `ENC_PACKET_LEN = 10` bytes:
 
-| Offset | Field | Type | Description |
-|---|---|---|---|
-| `0x00` | Magic | `uint8_t` | `0xC7` |
-| `0x01` | Version | `uint8_t` | `0x01` |
-| `0x02` | Type | `uint8_t` | `1` = data, `2` = ACK |
-| `0x03–04` | Source ID | `uint16_t` (BE) | |
-| `0x05–06` | Dest ID | `uint16_t` (BE) | |
-| `0x07–0A` | Sequence | `uint32_t` (BE) | Monotonic, persisted in NVS |
-| `0x0B–16` | Nonce | `uint8_t[12]` | From `esp_random()` |
-| `0x17` | Payload length | `uint8_t` | `0–16` |
-
-Encryption: AES-128-GCM, 12-byte random nonce, 16-byte tag — forged or corrupted frames are rejected.
-
-### Reliability (stop-and-wait ARQ)
-
-```
-Sender                  Receiver
-  │── DATA seq=N ──────>│
-  │<──── ACK seq=N ──────│
+```text
+[ nonce (8) ][ ciphertext (1) ][ tag (1) ]
 ```
 
-- ACK timeout `400 ms`, up to `3` retransmissions per frame
-- Receiver tracks seen sequence numbers, suppresses duplicate delivery, still ACKs them
+1. **Nonce:** 8 random bytes generated via `esp_random()` (hardware TRNG).
+2. **Keystream:** Derived via `AES-128-ECB(nonce || 0x00 * 8)` -> 16-byte block.
+3. **Ciphertext:** `Byte 0 of plaintext = token ^ keystream[0]`.
+4. **Tag:** `keystream[1]`.
+5. **Tokens:** ASCII characters (`.`, `-`, `/`, or `' '`).
 
-## OLED UI
+Because each nonce is fresh, keystream bytes are never reused. Non-`ENC_PACKET_LEN` packets are dropped and logged as `BAD PACKET SIZE`. Tag mismatches trigger a `BAD/UNAUTH PACKET` warning.
 
-SH1106 128×64, I2C @ 400 kHz. Shows TX/RX state, RSSI, outbox contents, sequence counters, message history.
+---
 
-## Dependencies
+## UI Layout (128 × 64)
 
-| Library | Purpose |
+```text
+┌────────────────────────────────────────────────┐
+│ LORA-CW  433  ▂▄▆█ -72      W  ▂▄▆█  │ Header
+├────────────────────────────────────────────────┤
+│ [TX] ··-   A   │  [RX] ·-     N       │ Key preview
+├────────────────────────────────────────────────┤
+│ ████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │ Progress
+├────────────────────────────────────────────────┤
+│ HELLO WORLD...                                 │
+│ ...MESSAGE LOG (24 × 3)                        │ Message log
+├────────────────────────────────────────────────┤
+│           CTRL: TAP CLEAR / HOLD SPACE        │ Footer
+└────────────────────────────────────────────────┘
+```
+
+The footer alternates between status and IP every 5 seconds, reflecting live keying state when active.
+
+---
+
+## Architecture Notes
+
+### Cooperative Scheduling
+`loop()` shares a single `millis()` timestamp across all subsystems:
+
+```cpp
+serviceInputs(now);   // Debounced buttons, key timing, finalization
+serviceRadio(now);    // TX queue drain + RX parsing
+serviceOutputs(now);  // LED pulses, beep queue, sidetone
+serviceTimers(now);   // Status expiry, cursor blink, RX timeout
+maintainWiFi(now);    // Retry state machine (250 ms poll)
+serviceDisplay(now);  // UI draw + single dirty-tile batch flush
+```
+
+No blocking `delay()` calls are present in the main execution path.
+
+### Display Flushing
+`drawUi()` renders the full frame into U8g2’s buffer. `flushDisplayStep()` pushes one row-adjacent run of changed tiles (up to 4) per loop iteration, returning immediately to preserve RF and key sampling latency.
+
+### RX Stale Timeout
+If the receiver remains mid-character (`incoming.length > 0` or `rxDiscarding`) for >= 10 s without receiving a mark, state clears and logs `RX GAP / LOST END`.
+
+### OTA Safety
+- `onStart`: Drains TX queue, stops outputs, idles LoRa, and renders progress UI.
+- `onError`: Restarts input debouncers, re-queues a `/` token to reset peer decoder, and reports error code.
+- `onEnd`: Retains `otaActive = true` through reboot.
+
+---
+
+## Serial Diagnostics (115200 Baud)
+
+| Tag | Meaning |
 |---|---|
-| [LoRa](https://github.com/sandeepmistry/arduino-LoRa) (sandeepmistry) | SX127x driver |
-| [U8g2](https://github.com/olikraus/u8g2) (olikraus) | OLED driver |
-| Preferences, ArduinoOTA, WiFi, mbedTLS | Bundled with the ESP32 Arduino core |
+| `[FATAL]` | AES key malformed — firmware halted in `setup()`. |
+| `[LoRa]` | Radio initialization state and parameters. |
+| `[WiFi]` | Connection attempts, IP acquisition, and link state. |
+| `[OTA]` | Flash progress, completion, and error codes. |
 
-## Deployment Checklist
+---
 
-- [ ] Wiring matches the pinout table (LoRa, OLED, key, button, buzzer, LEDs)
-- [ ] `DEVICE_ID` unique per node; `PEER_DEVICE_ID` points at the correct peer
-- [ ] Same AES-128 key on both nodes
-- [ ] Same LoRa RF parameters on both nodes; frequency legal for your region
-- [ ] WiFi credentials set if `ENABLE_OTA = true`
-- [ ] Partition scheme includes NVS
-- [ ] No secrets committed to version control
+## Troubleshooting
+
+| Symptom | Likely Cause |
+|---|---|
+| Firmware halts, logs `[FATAL]` | `AES_KEY_HEX` is not 32 hex characters or contains invalid characters. |
+| Header displays `RF!` | `LoRa.begin()` failed — verify wiring, CS/RST/DIO0 pins, and 3.3V rail. |
+| `BAD/UNAUTH PACKET` on RX | Key mismatch between nodes or severe RF corruption. |
+| `BAD PACKET SIZE` | Peer firmware version mismatch or stray packet on frequency. |
+| WiFi icon shows `✗` | `WIFI_SSID` is empty or credentials are incorrect. |
+| OLED display lag | `OLED_I2C_HZ` set too high for hardware module; drop to `200000`. |
+| No RX frames received | Receiver uninitialized or peer transmitter out of range. |
+
+---
 
 ## License
 
-MIT
+```text
+MIT License
+
+Copyright (c) 2026 LORA-CW contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
