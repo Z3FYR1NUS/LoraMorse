@@ -1,0 +1,25 @@
+# PlatformIO build outputs and caches
+.pio/
+.pioenvs/
+.piolibdeps/
+.clangd/
+
+.vscode/
+
+# C/C++ Compilation & Linker artifacts
+*.o
+*.elf
+*.bin
+*.hex
+*.out
+*.map
+
+Thumbs.db
+Desktop.ini
+[Dd]esktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# Local configuration overrides
+platformio.ini.local
+*.local
